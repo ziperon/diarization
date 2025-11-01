@@ -25,7 +25,7 @@ from transformers import (
 from huggingface_hub import snapshot_download
 
 # ------------------- Конфиги -------------------
-S3_BUCKET = "diarization-files"
+S3_BUCKET = "dionrecord"
 LOCAL_TMP = "/tmp/audiot"
 CHECK_INTERVAL = 10
 SUPPORTED_EXT = ['mp3', 'm4a', 'wav', 'flac']
@@ -49,10 +49,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 # ------------------- S3 -------------------
 s3 = boto3.client(
     "s3",
-    # endpoint_url='http://minio:9000',
-    endpoint_url='http://127.0.0.1:9000',
-    aws_access_key_id='minioadmin',
-    aws_secret_access_key='minioadmin'
+    endpoint_url='https://10.76.50.8:9000',
+    aws_access_key_id='ntA4tkufij5GsOZfDpNf',
+    aws_secret_access_key='zOCaL96ZdlECPy2rU5Pz4ffbPfvFWlYD3bSdrTGt',
+    verify=False
 )
 
 # ------------------- FastAPI -------------------
@@ -134,10 +134,10 @@ def load_pyannote_fast():
     start_time = time.time()
     
     try:
-        hf_token = os.getenv("HF_TOKEN")
+        hf_token = "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"
         pipeline = Pipeline.from_pretrained(
             PYANNOTE_MODEL,
-            use_auth_token=hf_token,
+            token=hf_token,
             cache_dir=MODELS_DIR
         )
         

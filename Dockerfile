@@ -15,28 +15,28 @@ COPY backend/ .
 RUN pip install --no-cache-dir --upgrade pip
 
 RUN pip install --no-cache-dir \
-    fastapi==0.110.0 \
-    uvicorn==0.24.0 \
-    requests==2.31.0 \
-    python-multipart==0.0.6 \
+    fastapi\
+    uvicorn\
+    requests\
+    python-multipart\
     boto3==1.34.0
 
 RUN pip install --no-cache-dir \
-    torch==2.0.1 \
-    torchaudio==2.0.2 \
-    transformers==4.37.2 \
-    huggingface-hub==0.20.3 \
-    pyannote.audio==3.1.1 \
-    pytorch-lightning==2.1.3 \
-    torchmetrics==1.3.1 \
-    matplotlib==3.8.4 \
-    scipy==1.11.4 \
+    torch \
+    torchaudio\
+    transformers\
+    huggingface-hub\
+    pyannote.audio\
+    pytorch-lightning\
+    torchmetrics\
+    matplotlib\
+    scipy\
     loguru \
     openai-whisper \
     whisper \
     librosa
 
-RUN pip install --force-reinstall --no-cache-dir "numpy==1.26.4"
+RUN pip install --force-reinstall --no-cache-dir "numpy"
 
 # 🗂️ Настраиваем кэш Hugging Face
 ENV HF_HOME=/models/hf_cache
