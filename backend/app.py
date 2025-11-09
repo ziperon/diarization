@@ -7,26 +7,18 @@ import subprocess
 import smtplib
 from email.mime.text import MIMEText
 import asyncio
-import gc
 import librosa
 import soundfile as sf
 from fastapi import FastAPI
 import boto3
 import torch
-import torchaudio
-
-import numpy as np
 from pyannote.audio import Pipeline
-from transformers import (
-    WhisperProcessor,
-    WhisperForConditionalGeneration,
-    pipeline as hf_pipeline
-)
+
 from huggingface_hub import snapshot_download
 
 # ------------------- Конфиги -------------------
 S3_BUCKET = "diarization-files"
-LOCAL_TMP = "/tmp/audiot"
+LOCAL_TMP =   os.path.join(os.getcwd(), "tmp", "audiot")
 CHECK_INTERVAL = 10
 SUPPORTED_EXT = ['mp3', 'm4a', 'wav', 'flac']
 
@@ -38,7 +30,10 @@ EMAIL_TO = "your-email@gmail.com"
 
 MODELS_DIR = "./models"
 PYANNOTE_MODEL = "pyannote/speaker-diarization-3.1"
-WHISPER_MODEL = "openai/whisper-large-v3-turbo"  # Вернули small для скорости
+WHISPER_MODEL = "openai/whisper-large-v3"
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 os.makedirs(LOCAL_TMP, exist_ok=True)
 os.makedirs(MODELS_DIR, exist_ok=True)
@@ -94,7 +89,7 @@ class PerformanceOptimizer:
 # ------------------- Быстрая конвертация -------------------
 def convert_to_wav_fast(input_path):
     """Быстрая конвертация аудио"""
-    logging.info(f"⚡ Конвертируем {os.path.basename(input_path)}...")
+    logging.info(f"⚡ Конвертируем {os.path.basename(input_path)}... {input_path}")
     start_time = time.time()
     
     temp_path = input_path.rsplit('.', 1)[0] + "_fast.wav"
@@ -107,13 +102,12 @@ def convert_to_wav_fast(input_path):
             "-ar", "16000",
             "-ac", "1",
             "-acodec", "pcm_s16le",
-            "-f", "wav",
-            "-threads", "2",  # Ограничиваем потоки для стабильности
+            "-f", "wav",  # Ограничиваем потоки для стабильности
             temp_path
         ]
+    
         
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        
+        result = subprocess.run(cmd, capture_output=True, text=True, shell=True, check=True)
         if result.returncode != 0:
             raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
         
@@ -127,6 +121,21 @@ def convert_to_wav_fast(input_path):
             os.remove(temp_path)
         raise
 
+def preload_all_models():
+    """Предварительная загрузка всех моделей при старте"""
+    logging.info("🔄 Предзагрузка всех моделей...")
+    global diarization_pipeline, whisper_model, device
+    
+    PerformanceOptimizer.optimize_torch()
+    device_type = PerformanceOptimizer.get_available_device()
+    logging.info(f"🎯 Основное устройство: {device_type}")
+    
+    # Загружаем модели последовательно
+    diarization_pipeline = load_pyannote_fast()
+    whisper_model, device = load_whisper_fast()
+    
+    logging.info("✅ Все модели предзагружены")
+
 # ------------------- Быстрая загрузка моделей -------------------
 def load_pyannote_fast():
     """Быстрая загрузка pyannote"""
@@ -134,7 +143,7 @@ def load_pyannote_fast():
     start_time = time.time()
     
     try:
-        hf_token = os.getenv("HF_TOKEN")
+        hf_token = "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"
         pipeline = Pipeline.from_pretrained(
             PYANNOTE_MODEL,
             use_auth_token=hf_token,
@@ -152,73 +161,86 @@ def load_pyannote_fast():
         raise
 
 def load_whisper_fast():
-    """Быстрая загрузка Whisper"""
-    logging.info("⚡ Загружаем Whisper...")
-    start_time = time.time()
+    """Используем оригинальный Whisper вместо Faster-Whisper"""
+    logging.info("🔄 Загружаем оригинальный Whisper...")
     
     try:
-        local_path = os.path.join(MODELS_DIR, "whisper-trubo")
+        import whisper
         
-        if not os.path.exists(local_path):
-            logging.info("📥 Скачиваем модель...")
-            local_path = snapshot_download(repo_id=WHISPER_MODEL, cache_dir=MODELS_DIR)
-
-        processor = WhisperProcessor.from_pretrained(local_path)
-        model = WhisperForConditionalGeneration.from_pretrained(local_path)
+        device_type = PerformanceOptimizer.get_available_device()
         
-        device = PerformanceOptimizer.get_available_device()
-        model.to(device)
-        model.eval()
+        # Загружаем модель
+        model = whisper.load_model("large", device=device_type, download_root=MODELS_DIR)
         
-        PerformanceOptimizer.log_processing_time(start_time, "Загрузка Whisper")
-        return processor, model, device
+        # Создаем правильную обертку для совместимости
+        class WhisperWrapper:
+            def __init__(self, model):
+                self.model = model
+            
+            def transcribe(self, audio_path, beam_size=5, language="ru"):
+                # Убираем конфликтующие аргументы
+                result = self.model.transcribe(
+                    audio_path, 
+                    language=language,
+                    beam_size=beam_size,
+                    fp16=(device_type == "cuda")
+                )
+                logging.debug(f"⏱ Транскрипция завершена: {result}")
+                
+                # Создаем совместимый формат вывода
+                segments = []
+                for seg in result["segments"]:
+                    # Создаем объект сегмента с нужными атрибутами
+                    segment_obj = type('Segment', (), {
+                        'start': seg['start'],
+                        'end': seg['end'], 
+                        'text': seg['text'].strip()
+                    })()
+                    segments.append(segment_obj)
+                
+                # Создаем объект info
+                info_obj = type('Info', (), {'language': 'ru'})()
+                
+                return segments, info_obj
+        
+        return WhisperWrapper(model), device_type
         
     except Exception as e:
-        logging.error(f"❌ Ошибка загрузки Whisper: {e}")
+        logging.error(f"❌ Ошибка загрузки оригинального Whisper: {e}")
         raise
 
 # Глобальные переменные для моделей
 diarization_pipeline = None
-processor = None
 whisper_model = None
 device = None
 
 def initialize_models_fast():
     """Быстрая инициализация моделей"""
-    global diarization_pipeline, processor, whisper_model, device
+    global diarization_pipeline, whisper_model, device
     
-    PerformanceOptimizer.optimize_torch()
-    
-    if diarization_pipeline is None:
-        diarization_pipeline = load_pyannote_fast()
-        
-    if whisper_model is None:
-        processor, whisper_model, device = load_whisper_fast()
-    
-    logging.info("✅ Модели готовы к работе")
+    if diarization_pipeline is None or whisper_model is None:
+        preload_all_models()
 
 # ------------------- Быстрая транскрипция -------------------
 def transcribe_fast(audio_path):
-    """Быстрая транскрипция"""
+    """Быстрая транскрипция с Faster-Whisper"""
     logging.info("🎧 Быстрая транскрипция...")
     start_time = time.time()
-    
-    try:
-        # Используем более быстрые настройки
-        asr = hf_pipeline(
-            "automatic-speech-recognition",
-            model=WHISPER_MODEL,
-            chunk_length_s=20,
-            stride_length_s=5,
-            generate_kwargs={"language": "russian"},
-            device=0 if torch.cuda.is_available() else -1,  # GPU если есть
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        )
 
-        result = asr(audio_path, return_timestamps=True)
-        
+    try:
+        segments, info = whisper_model.transcribe(audio_path, beam_size=1, language="ru")
+        result_text = ""
+        result_chunks = []
+
+        for segment in segments:
+            result_text += segment.text + " "
+            result_chunks.append({
+                "timestamp": [segment.start, segment.end],
+                "text": segment.text
+            })
+
         PerformanceOptimizer.log_processing_time(start_time, "Транскрипция")
-        return result["text"], result["chunks"]
+        return result_text.strip(), result_chunks
 
     except Exception as e:
         logging.error(f"❌ Ошибка транскрипции: {e}")
@@ -337,6 +359,7 @@ def align_diarization_and_transcript_fast(diarization, transcript_chunks):
 
 def send_email(subject, body):
     """Отправка email"""
+    logging.info(f"📧 Отправка email: {body}")
     try:
         msg = MIMEText(body)
         msg['Subject'] = subject
@@ -355,6 +378,7 @@ def process_file_fast(s3_key):
     total_start_time = time.time()
     
     try:
+        logging.info(f"LOCAL_TMP: {LOCAL_TMP}")
         initialize_models_fast()
 
         local_path = os.path.join(LOCAL_TMP, os.path.basename(s3_key))

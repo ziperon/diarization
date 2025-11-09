@@ -14,16 +14,16 @@ COPY backend/ .
 
 RUN pip install --no-cache-dir --upgrade pip
 
-RUN pip install --no-cache-dir \
-    fastapi==0.110.0 \
-    uvicorn==0.24.0 \
-    requests==2.31.0 \
-    python-multipart==0.0.6 \
+RUN pip install --no-cache-dir fastapi==0.110.0 \
+    uvicorn==0.31.1 \
+    requests==2.32.3 \
+    python-multipart==0.0.9 \
     boto3==1.34.0
 
+
+RUN pip install torch==2.2.0+cu121 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
 RUN pip install --no-cache-dir \
-    torch==2.0.1 \
-    torchaudio==2.0.2 \
     transformers==4.37.2 \
     huggingface-hub==0.20.3 \
     pyannote.audio==3.1.1 \
@@ -34,6 +34,8 @@ RUN pip install --no-cache-dir \
     loguru \
     openai-whisper \
     whisper \
+    "ctranslate2[cuda]" \
+    faster-whisper \
     librosa
 
 RUN pip install --force-reinstall --no-cache-dir "numpy==1.26.4"
