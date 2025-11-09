@@ -143,7 +143,7 @@ def load_pyannote_fast():
     start_time = time.time()
     
     try:
-        hf_token = "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"
+        hf_token = ""
         pipeline = Pipeline.from_pretrained(
             PYANNOTE_MODEL,
             use_auth_token=hf_token,
