@@ -13,12 +13,11 @@ from fastapi import FastAPI
 import boto3
 import torch
 from pyannote.audio import Pipeline
-
-from huggingface_hub import snapshot_download
+import whisper  # ← ДОБАВИТЬ прямой импорт
 
 # ------------------- Конфиги -------------------
 S3_BUCKET = "diarization-files"
-LOCAL_TMP =   os.path.join(os.getcwd(), "tmp", "audiot")
+LOCAL_TMP = os.path.join(os.getcwd(), "tmp", "audiot")
 CHECK_INTERVAL = 10
 SUPPORTED_EXT = ['mp3', 'm4a', 'wav', 'flac']
 
@@ -30,7 +29,7 @@ EMAIL_TO = "your-email@gmail.com"
 
 MODELS_DIR = "./models"
 PYANNOTE_MODEL = "pyannote/speaker-diarization-3.1"
-WHISPER_MODEL = "openai/whisper-large-v3"
+WHISPER_MODEL = "large-v2"  # ← ИСПОЛЬЗУЕМ large-v2 (быстрее чем v3)
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -44,7 +43,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 # ------------------- S3 -------------------
 s3 = boto3.client(
     "s3",
-    # endpoint_url='http://minio:9000',
     endpoint_url='http://127.0.0.1:9000',
     aws_access_key_id='minioadmin',
     aws_secret_access_key='minioadmin'
@@ -62,13 +60,9 @@ class PerformanceOptimizer:
         """Определяем лучшее доступное устройство"""
         if torch.cuda.is_available():
             gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
-            if gpu_memory >= 4:  # Если GPU с 4+ GB памяти
+            if gpu_memory >= 4:
                 logging.info(f"🎯 Используем GPU: {torch.cuda.get_device_name(0)} ({gpu_memory:.1f} GB)")
                 return "cuda"
-        
-        if hasattr(torch, 'mps') and torch.backends.mps.is_available():
-            logging.info("🎯 Используем Apple MPS")
-            return "mps"
         
         logging.info("🎯 Используем CPU")
         return "cpu"
@@ -76,9 +70,11 @@ class PerformanceOptimizer:
     @staticmethod
     def optimize_torch():
         """Оптимизируем PyTorch для скорости"""
-        torch.set_num_threads(min(4, os.cpu_count() or 4))
+        torch.set_num_threads(min(8, os.cpu_count() or 8))  # ↑ увеличили потоки
         if torch.cuda.is_available():
             torch.backends.cudnn.benchmark = True
+            # Очищаем кеш CUDA для избежания утечек памяти
+            torch.cuda.empty_cache()
     
     @staticmethod
     def log_processing_time(start_time, operation_name):
@@ -89,28 +85,26 @@ class PerformanceOptimizer:
 # ------------------- Быстрая конвертация -------------------
 def convert_to_wav_fast(input_path):
     """Быстрая конвертация аудио"""
-    logging.info(f"⚡ Конвертируем {os.path.basename(input_path)}... {input_path}")
+    logging.info(f"⚡ Конвертируем {os.path.basename(input_path)}...")
     start_time = time.time()
     
     temp_path = input_path.rsplit('.', 1)[0] + "_fast.wav"
     
     try:
-        # Быстрая конвертация с оптимизированными параметрами
+        # Оптимизированные параметры FFmpeg
         cmd = [
             "ffmpeg", "-y", 
             "-i", input_path,
             "-ar", "16000",
             "-ac", "1",
             "-acodec", "pcm_s16le",
-            "-f", "wav",  # Ограничиваем потоки для стабильности
+            "-threads", "4",  # ↑ многопоточность
+            "-hide_banner",
+            "-loglevel", "error",
             temp_path
         ]
-    
         
-        result = subprocess.run(cmd, capture_output=True, text=True, shell=True, check=True)
-        if result.returncode != 0:
-            raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
-        
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         os.replace(temp_path, input_path)
         PerformanceOptimizer.log_processing_time(start_time, "Конвертация")
         return input_path
@@ -121,37 +115,26 @@ def convert_to_wav_fast(input_path):
             os.remove(temp_path)
         raise
 
-def preload_all_models():
-    """Предварительная загрузка всех моделей при старте"""
-    logging.info("🔄 Предзагрузка всех моделей...")
-    global diarization_pipeline, whisper_model, device
-    
-    PerformanceOptimizer.optimize_torch()
-    device_type = PerformanceOptimizer.get_available_device()
-    logging.info(f"🎯 Основное устройство: {device_type}")
-    
-    # Загружаем модели последовательно
-    diarization_pipeline = load_pyannote_fast()
-    whisper_model, device = load_whisper_fast()
-    
-    logging.info("✅ Все модели предзагружены")
-
-# ------------------- Быстрая загрузка моделей -------------------
+# ------------------- Оптимизированная загрузка моделей -------------------
 def load_pyannote_fast():
-    """Быстрая загрузка pyannote"""
+    """Быстрая загрузка pyannote с оптимизацией"""
     logging.info("⚡ Загружаем pyannote...")
     start_time = time.time()
     
     try:
-        hf_token = ""
+        hf_token = "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"  # ← НУЖЕН ТОКЕН!
         pipeline = Pipeline.from_pretrained(
             PYANNOTE_MODEL,
             use_auth_token=hf_token,
             cache_dir=MODELS_DIR
         )
         
-        device = PerformanceOptimizer.get_available_device()
-        pipeline = pipeline.to(torch.device(device))
+        device_type = PerformanceOptimizer.get_available_device()
+        pipeline = pipeline.to(torch.device(device_type))
+        
+        # Оптимизируем настройки для скорости
+        pipeline._segmentation.batch_size = 4  # ↑ батч-сайз
+        pipeline._segmentation.device = torch.device(device_type)
         
         PerformanceOptimizer.log_processing_time(start_time, "Загрузка PyAnnote")
         return pipeline
@@ -161,52 +144,25 @@ def load_pyannote_fast():
         raise
 
 def load_whisper_fast():
-    """Используем оригинальный Whisper вместо Faster-Whisper"""
-    logging.info("🔄 Загружаем оригинальный Whisper...")
+    """Оптимизированная загрузка Whisper"""
+    logging.info("🔄 Загружаем оптимизированный Whisper...")
+    start_time = time.time()
     
     try:
-        import whisper
-        
         device_type = PerformanceOptimizer.get_available_device()
         
-        # Загружаем модель
-        model = whisper.load_model("large", device=device_type, download_root=MODELS_DIR)
+        # Загружаем модель с оптимизацией
+        model = whisper.load_model(
+            WHISPER_MODEL, 
+            device=device_type,
+            download_root=MODELS_DIR
+        )
         
-        # Создаем правильную обертку для совместимости
-        class WhisperWrapper:
-            def __init__(self, model):
-                self.model = model
-            
-            def transcribe(self, audio_path, beam_size=5, language="ru"):
-                # Убираем конфликтующие аргументы
-                result = self.model.transcribe(
-                    audio_path, 
-                    language=language,
-                    beam_size=beam_size,
-                    fp16=(device_type == "cuda")
-                )
-                logging.debug(f"⏱ Транскрипция завершена: {result}")
-                
-                # Создаем совместимый формат вывода
-                segments = []
-                for seg in result["segments"]:
-                    # Создаем объект сегмента с нужными атрибутами
-                    segment_obj = type('Segment', (), {
-                        'start': seg['start'],
-                        'end': seg['end'], 
-                        'text': seg['text'].strip()
-                    })()
-                    segments.append(segment_obj)
-                
-                # Создаем объект info
-                info_obj = type('Info', (), {'language': 'ru'})()
-                
-                return segments, info_obj
-        
-        return WhisperWrapper(model), device_type
+        PerformanceOptimizer.log_processing_time(start_time, "Загрузка Whisper")
+        return model, device_type
         
     except Exception as e:
-        logging.error(f"❌ Ошибка загрузки оригинального Whisper: {e}")
+        logging.error(f"❌ Ошибка загрузки Whisper: {e}")
         raise
 
 # Глобальные переменные для моделей
@@ -221,99 +177,99 @@ def initialize_models_fast():
     if diarization_pipeline is None or whisper_model is None:
         preload_all_models()
 
-# ------------------- Быстрая транскрипция -------------------
-def transcribe_fast(audio_path):
-    """Быстрая транскрипция с Faster-Whisper"""
-    logging.info("🎧 Быстрая транскрипция...")
+def preload_all_models():
+    """Предварительная загрузка всех моделей"""
+    logging.info("🔄 Предзагрузка всех моделей...")
+    global diarization_pipeline, whisper_model, device
+    
+    PerformanceOptimizer.optimize_torch()
+    device_type = PerformanceOptimizer.get_available_device()
+    
+    diarization_pipeline = load_pyannote_fast()
+    whisper_model, device = load_whisper_fast()
+    
+    logging.info("✅ Все модели предзагружены")
+
+# ------------------- ОПТИМИЗИРОВАННАЯ транскрипция -------------------
+def transcribe_optimized(audio_path):
+    """ОПТИМИЗИРОВАННАЯ транскрипция с лучшими настройками"""
+    logging.info("🎧 Оптимизированная транскрипция...")
     start_time = time.time()
 
     try:
-        segments, info = whisper_model.transcribe(audio_path, beam_size=1, language="ru")
+        # ОПТИМАЛЬНЫЕ НАСТРОЙКИ ДЛЯ СКОРОСТИ
+        result = whisper_model.transcribe(
+            audio_path,
+            language="ru",
+            fp16=True,  # ВКЛЮЧАЕМ FP16 (2x ускорение на GPU)
+            beam_size=3,  # ↓ уменьшаем для скорости
+            best_of=2,    # ↓ уменьшаем для скорости  
+            temperature=0.0,  # Более стабильные результаты
+            no_speech_threshold=0.6,  # Лучше определяет речь
+            compression_ratio_threshold=2.4,  # Фильтрация шума
+            condition_on_previous_text=False,  # ↑ ускоряет длинные аудио
+            word_timestamps=True  # Нужно для диаризации
+        )
+        
         result_text = ""
         result_chunks = []
 
-        for segment in segments:
-            result_text += segment.text + " "
+        for segment in result["segments"]:
+            result_text += segment["text"] + " "
             result_chunks.append({
-                "timestamp": [segment.start, segment.end],
-                "text": segment.text
+                "timestamp": [segment["start"], segment["end"]],
+                "text": segment["text"].strip()
             })
 
         PerformanceOptimizer.log_processing_time(start_time, "Транскрипция")
+        logging.info(f"📝 Транскрибировано: {len(result_text)} символов, {len(result_chunks)} сегментов")
         return result_text.strip(), result_chunks
 
     except Exception as e:
         logging.error(f"❌ Ошибка транскрипции: {e}")
         raise
 
-# ------------------- Оптимизированная обработка -------------------
-def process_short_audio_fast(audio_path):
-    """Быстрая обработка коротких аудио"""
-    logging.info("🔹 Быстрая обработка аудио...")
+# ------------------- ОПТИМИЗИРОВАННАЯ обработка -------------------
+def process_audio_optimized(audio_path):
+    """УНИФИЦИРОВАННАЯ оптимизированная обработка"""
+    logging.info("🔹 Оптимизированная обработка аудио...")
     start_time = time.time()
     
     if diarization_pipeline is None:
         raise ValueError("Diarization pipeline не инициализирован")
 
-    # Диаризация
-    diarization = diarization_pipeline(audio_path)
+    # Очищаем кеш CUDA перед обработкой
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Параллельная обработка диаризации и транскрипции
+    import threading
     
-    # Транскрипция
-    full_text, chunks = transcribe_fast(audio_path)
+    diarization_result = [None]
+    transcription_result = [None]
     
-    # Объединение
-    result = align_diarization_and_transcript_fast(diarization, chunks)
+    def run_diarization():
+        diarization_result[0] = diarization_pipeline(audio_path)
     
-    PerformanceOptimizer.log_processing_time(start_time, "Обработка аудио")
+    def run_transcription():
+        transcription_result[0] = transcribe_optimized(audio_path)
+    
+    # Запускаем в параллельных потоках
+    t1 = threading.Thread(target=run_diarization)
+    t2 = threading.Thread(target=run_transcription)
+    
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    
+    full_text, chunks = transcription_result[0]
+    
+    # Объединение результатов
+    result = align_diarization_and_transcript_fast(diarization_result[0], chunks)
+    
+    PerformanceOptimizer.log_processing_time(start_time, "Полная обработка")
     return result
-
-def process_long_audio_fast(audio_path, chunk_duration=300):  # Увеличили чанки
-    """Быстрая обработка длинных аудио"""
-    logging.info("🔸 Быстрая обработка длинного аудио...")
-    start_time = time.time()
-    
-    if diarization_pipeline is None:
-        raise ValueError("Diarization pipeline не инициализирован")
-
-    # Загружаем все аудио сразу (быстрее чем по частям)
-    y, sr = librosa.load(audio_path, sr=16000, mono=True)
-    total_duration = len(y) / sr
-    logging.info(f"📊 Общая длительность: {total_duration:.1f} сек")
-
-    all_segments = []
-    chunk_size = chunk_duration * sr
-
-    for i, start_sample in enumerate(range(0, len(y), chunk_size)):
-        chunk_end = min(start_sample + chunk_size, len(y))
-        chunk_audio = y[start_sample:chunk_end]
-
-        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-            temp_path = temp_file.name
-            sf.write(temp_path, chunk_audio, sr)
-
-        try:
-            logging.info(f"🔹 Обработка чанка {i+1}...")
-            
-            # Параллельная обработка не используется для стабильности
-            chunk_diarization = diarization_pipeline(temp_path)
-            _, chunk_chunks = transcribe_fast(temp_path)
-            chunk_result = align_diarization_and_transcript_fast(chunk_diarization, chunk_chunks)
-
-            # Корректируем временные метки
-            time_offset = start_sample / sr
-            for segment in chunk_result:
-                segment["start"] += time_offset
-                segment["end"] += time_offset
-
-            all_segments.extend(chunk_result)
-            logging.info(f"✅ Чанк {i+1} обработан")
-
-        finally:
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
-
-    PerformanceOptimizer.log_processing_time(start_time, "Обработка длинного аудио")
-    return all_segments
 
 def align_diarization_and_transcript_fast(diarization, transcript_chunks):
     """Быстрое объединение результатов"""
@@ -344,22 +300,22 @@ def align_diarization_and_transcript_fast(diarization, transcript_chunks):
             "text": chunk["text"].strip()
         })
 
-    # Быстрое объединение
+    # Объединение сегментов
     merged = []
     for seg in segments:
         if (merged and 
             seg["speaker"] == merged[-1]["speaker"] and 
-            seg["start"] <= merged[-1]["end"] + 2.0):  # Увеличили интервал
+            seg["start"] <= merged[-1]["end"] + 1.5):  # Оптимальный интервал
             merged[-1]["end"] = seg["end"]
             merged[-1]["text"] += " " + seg["text"]
         else:
             merged.append(seg)
 
+    logging.info(f"🎯 Объединено в {len(merged)} сегментов")
     return merged
 
 def send_email(subject, body):
     """Отправка email"""
-    logging.info(f"📧 Отправка email: {body}")
     try:
         msg = MIMEText(body)
         msg['Subject'] = subject
@@ -373,12 +329,11 @@ def send_email(subject, body):
         logging.error(f"Ошибка при отправке email: {e}")
 
 def process_file_fast(s3_key):
-    """Быстрая обработка файла"""
+    """ОПТИМИЗИРОВАННАЯ обработка файла"""
     local_path = None
     total_start_time = time.time()
     
     try:
-        logging.info(f"LOCAL_TMP: {LOCAL_TMP}")
         initialize_models_fast()
 
         local_path = os.path.join(LOCAL_TMP, os.path.basename(s3_key))
@@ -397,11 +352,8 @@ def process_file_fast(s3_key):
         duration = librosa.get_duration(filename=local_path)
         logging.info(f"⏱ Длительность аудио: {duration:.1f} секунд")
 
-        # Выбираем стратегию
-        if duration > 600:  # 10 минут
-            result_segments = process_long_audio_fast(local_path)
-        else:
-            result_segments = process_short_audio_fast(local_path)
+        # ВСЕГДА используем оптимизированную обработку
+        result_segments = process_audio_optimized(local_path)
 
         # Результат
         result_json = json.dumps({
@@ -413,6 +365,7 @@ def process_file_fast(s3_key):
         }, ensure_ascii=False, indent=2)
 
         send_email(f"Диаризация {os.path.basename(s3_key)}", result_json)
+        
         try:
             s3.delete_object(Bucket=S3_BUCKET, Key=s3_key)
             logging.info(f"🗑 Удален из S3: {s3_key}")
@@ -420,7 +373,8 @@ def process_file_fast(s3_key):
             logging.error(f"Ошибка удаления из S3: {e}")
         
         total_time = time.time() - total_start_time
-        logging.info(f"✅ Обработка завершена за {total_time:.1f} сек: {len(result_segments)} сегментов")
+        speed_ratio = duration / total_time if total_time > 0 else 0
+        logging.info(f"✅ Обработка завершена за {total_time:.1f} сек ({speed_ratio:.2f}x реального времени)")
 
     except Exception as e:
         logging.error(f"❌ Ошибка обработки файла {s3_key}: {e}")
@@ -428,6 +382,9 @@ def process_file_fast(s3_key):
     finally:
         if local_path and os.path.exists(local_path):
             os.remove(local_path)
+        # Очищаем память после обработки
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 # ------------------- Фоновый цикл -------------------
 async def background_loop():
@@ -442,7 +399,7 @@ async def background_loop():
 
             for obj in objs:
                 process_file_fast(obj["Key"])
-                await asyncio.sleep(2)  # Уменьшили паузу
+                await asyncio.sleep(1)
 
         except Exception as e:
             logging.error(f"❌ Ошибка в фоновом цикле: {e}")
@@ -453,35 +410,23 @@ async def background_loop():
 @app.on_event("startup")
 async def startup_event():
     """Запуск фоновой задачи при старте"""
-    logging.info("🚀 Запуск быстрого фонового цикла...")
+    logging.info("🚀 Предзагрузка моделей...")
+    preload_all_models()
+    logging.info("🚀 Запуск оптимизированного фонового цикла...")
     asyncio.create_task(background_loop())
 
-# ------------------- FastAPI endpoint -------------------
 @app.get("/")
 def read_root():
-    return {"status": "ok", "optimized_for_speed": True}
+    return {"status": "ok", "optimized": True, "version": "2.0"}
 
 @app.get("/health")
 def health_check():
-    """Проверка здоровья сервиса"""
     device_type = PerformanceOptimizer.get_available_device()
     return {
         "status": "healthy",
         "device": device_type,
-        "models_loaded": diarization_pipeline is not None and whisper_model is not None,
-        "gpu_available": torch.cuda.is_available()
+        "models_loaded": diarization_pipeline is not None and whisper_model is not None
     }
 
-@app.get("/performance")
-def performance_info():
-    """Информация о производительности"""
-    return {
-        "device": PerformanceOptimizer.get_available_device(),
-        "gpu_available": torch.cuda.is_available(),
-        "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
-        "cpu_threads": torch.get_num_threads()
-    }
-
-# ------------------- Запуск -------------------
 if __name__ == "__main__":
     asyncio.run(background_loop())
