@@ -1,2 +1,4 @@
 minio
 backend/aaa.py
+secret.key
+.vscode/*
