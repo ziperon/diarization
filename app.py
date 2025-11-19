@@ -1,3 +1,4 @@
+import pandas as pd
 import os
 import time
 import json
@@ -19,36 +20,36 @@ from pyannote.audio import Pipeline
 import whisper  # ← ДОБАВИТЬ прямой импорт
 from dion_client import DionApiClient, DionApiError
 import settings
-
-# Исправление для загрузки моделей pyannote в новых версиях PyTorch
-# Разрешаем необходимые классы для безопасной загрузки весов
-try:
-    from torch.torch_version import TorchVersion
-    from pyannote.audio.core.task import Specifications
-    torch.serialization.add_safe_globals([TorchVersion, Specifications])
-except (ImportError, AttributeError) as e:
-    # Если версия PyTorch не поддерживает это или классы не найдены, пропускаем
-    logging.debug(f"Не удалось добавить безопасные глобалы: {e}")
-    pass
+import requests
+from huggingface_hub import snapshot_download
+from datetime import datetime, timedelta
+import warnings
+from crypto import encrypt_password, decrypt_password
 
 
-
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+warnings.filterwarnings("ignore")
 
 os.makedirs(settings.LOCAL_TMP, exist_ok=True)
 os.makedirs(settings.MODELS_DIR, exist_ok=True)
+os.environ["HTTP_PROXY"] = ""
+os.environ["HTTPS_PROXY"] = ""
 
 # ------------------- Логирование -------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-
 # ------------------- S3 -------------------
 s3 = boto3.client(
     "s3",
-    endpoint_url='http://127.0.0.1:9000',
-    aws_access_key_id='minioadmin',
-    aws_secret_access_key='minioadmin'
+    endpoint_url='https://10.76.50.8:9000',
+    aws_access_key_id=decrypt_password(settings.AWS_ACCESS_KEY_ID),
+    aws_secret_access_key=decrypt_password(settings.AWS_SECRET_ACCESS_KEY),
+    verify = False,
+    region_name='us-east-1'
 )
+try:
+    s3.list_buckets()
+    print("✅ Успешно подключились к MinIO!")
+except ClientError as e:
+    print("❌ Ошибка подключения:", e.response['Error']['Code'], e.response['Error']['Message'])
 
 # ------------------- FastAPI -------------------
 app = FastAPI()
@@ -124,25 +125,23 @@ def load_pyannote_fast():
     start_time = time.time()
     
     try:
-        hf_token = "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"  # ← НУЖЕН ТОКЕН!
-        
+
         # Используем контекстный менеджер для безопасной загрузки с необходимыми классами
         try:
             from torch.torch_version import TorchVersion
             from pyannote.audio.core.task import Specifications
             with torch.serialization.safe_globals([TorchVersion, Specifications]):
-                pipeline = Pipeline.from_pretrained(
+            	pipeline = Pipeline.from_pretrained(
                     settings.PYANNOTE_MODEL,
-                    use_auth_token=hf_token,
-                    cache_dir=settings.MODELS_DIR
+                    cache_dir=settings.MODELS_DIR,
+		    local_files_only=True
                 )
         except (ImportError, AttributeError, TypeError) as e:
             # Если контекстный менеджер не поддерживается, загружаем обычным способом
             logging.debug(f"Контекстный менеджер не поддерживается, используем обычную загрузку: {e}")
-            pipeline = Pipeline.from_pretrained(
-                settings.PYANNOTE_MODEL,
-                use_auth_token=hf_token,
-                cache_dir=settings.MODELS_DIR
+       	    pipeline = Pipeline.from_pretrained(
+               	settings.PYANNOTE_MODEL,
+               	cache_dir=settings.MODELS_DIR
             )
         
         device_type = PerformanceOptimizer.get_available_device()
@@ -245,7 +244,9 @@ def preload_all_models():
     """Предварительная загрузка всех моделей"""
     logging.info("🔄 Предзагрузка всех моделей...")
     global diarization_pipeline, whisper_model, device
-    
+
+    patch_torch_for_weights_only()
+
     PerformanceOptimizer.optimize_torch()
     device_type = PerformanceOptimizer.get_available_device()
     
@@ -272,21 +273,21 @@ def transcribe_optimized(audio_path):
                 word_timestamps=True,  # Нужно для диаризации
                 beam_size=5,  # ↑ Увеличено для лучшего качества (было 3)
                 best_of=5,    # ↑ Увеличено для лучшего качества (было 2)
-                temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),  # Temperature fallback для лучшего качества
+                temperature=0,  # Temperature fallback для лучшего качества
                 no_speech_threshold=0.6,  # Лучше определяет речь
                 compression_ratio_threshold=2.4,  # Фильтрация шума
-                condition_on_previous_text=True,  # ↑ Включено для лучшего контекста
+                condition_on_previous_text=False,  # ↑ Включено для лучшего контекста
                 logprob_threshold=-1.0,  # Фильтрация низкокачественных сегментов
                 initial_prompt="Это запись разговора на русском языке. "  # Подсказка для лучшего распознавания
             )
         else:
-            # НАСТРОЙКИ ДЛЯ СКОРОСТИ (по умолчанию)
+            # НАСТРОЙКИ ДЛЯ СКОРОСТИ (по умолчанию)s
             logging.info("⚡ Используем режим скорости")
             result = whisper_model.transcribe(
                 audio_path,
                 language="ru",
                 fp16=True,  # ВКЛЮЧАЕМ FP16 (2x ускорение на GPU)
-                word_timestamps=True,  # Нужно для диаризации
+                word_timsestamps=True,  # Нужно для диаризации
                 beam_size=3,  # ↓ уменьшаем для скорости
                 best_of=2,    # ↓ уменьшаем для скорости  
                 temperature=0.0,  # Более стабильные результаты
@@ -475,6 +476,39 @@ def get_user_id_for_time_advanced(tracks, start_time, end_time, previous_segment
     
     # Если нет хороших кандидатов, используем эвристики
     return get_user_id_contextual(tracks, start_time, end_time, previous_segments)
+
+def parse_event_path_and_get_range(path: str) -> tuple[str, str, str]:
+    """
+    Пример входа:
+        '/f6c28cf1-4c6c-44b4-a670-35158d9798a0/2025-11-10T11-21-00'
+
+    Возвращает:
+        event_id, time_start, time_end
+        (в ISO8601 формате: yyyy-mm-ddTHH:MM:SSZ)
+    """
+    # Убираем лишние пробелы и слеши по краям
+    clean = path.strip().strip("/")
+
+    parts = clean.split("/")
+    if len(parts) != 2:
+        raise ValueError(f"Некорректный путь: {path}")
+
+    event_id = parts[0]
+    raw_dt = parts[1]
+
+    # Пример: 2025-11-10T11-21-00 → приводим к datetime
+    dt = datetime.strptime(raw_dt, "%Y-%m-%dT%H-%M-%S")
+
+    # Вычисляем диапазон ±5 часов
+    time_start = dt - timedelta(hours=2)
+    time_end = dt + timedelta(hours=2)
+
+    # Возвращаем ISO8601 в UTC
+    return (
+        event_id,
+        time_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        time_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
 
 def get_user_id_contextual(tracks, start_time, end_time, previous_segments=None):
     """Контекстные эвристики с учетом предыдущих сегментов"""
@@ -677,9 +711,10 @@ def align_diarization_and_transcript_contextual(diarization, transcript_chunks, 
         }
         
         if user_id:
-            segment["user_id"] = user_id
+            #segment["user_id"] = user_id
             if users_info and user_id in users_info and users_info[user_id]:
-                segment["user_info"] = users_info[user_id]
+                #segment["user_info"] = users_info[user_id]
+                segment["speaker_name"] = users_info[user_id]["name"]
         
         segments.append(segment)
         previous_segments.append(segment)
@@ -717,29 +752,68 @@ def align_diarization_and_transcript_contextual(diarization, transcript_chunks, 
 
     return merged
 
-def get_users_info(user_ids, dion_client=None):
-    """Получить информацию о пользователях из DION API с кешированием"""
-    if not dion_client or not user_ids:
+def get_users_info(user_ids, dion_client=None, event_id=None, time_start=None, time_end=None):
+    """
+    Получить информацию о пользователях из DION API с кешированием, используя get_event_users.
+
+    Аргументы:
+        user_ids: список user_id, которых нужно выбрать из ответа
+        dion_client: экземпляр DionApiClient
+        event_id: UUID события для запроса
+        time_start: начало периода ISO8601
+        time_end: конец периода ISO8601
+    Возвращает:
+        dict: {user_id: user_info или None}
+    """
+
+    if not dion_client or not user_ids or not event_id:
         return {}
-    
+
+    unique_user_ids = set(user_ids)
     users_info = {}
-    unique_user_ids = list(set(user_ids))
-    
-    logging.info(f"👤 Запрашиваем информацию о {len(unique_user_ids)} пользователях из DION API")
-    
-    for user_id in unique_user_ids:
-        try:
-            user_data = dion_client.get_user_by_id(user_id)
-            users_info[user_id] = user_data
-            logging.debug(f"✅ Получена информация о пользователе {user_id}")
-        except DionApiError as e:
-            logging.warning(f"⚠️ Не удалось получить информацию о пользователе {user_id}: {e}")
-            users_info[user_id] = None
-        except Exception as e:
-            logging.error(f"❌ Ошибка при запросе пользователя {user_id}: {e}")
-            users_info[user_id] = None
-    
+
+    logging.info(f"👤 Запрашиваем пользователей события {event_id} из DION API")
+
+    try:
+        # 1. Запрос всех пользователей события за период
+        response = dion_client.get_event_users(
+            event_id=event_id,
+            time_start=time_start,
+            time_end=time_end
+        )
+
+        event_users = response.get("users", [])
+        logging.info(f"📁 Получено {len(event_users)} пользователей из DION API")
+
+        # 2. Сопоставляем только нужные user_id из tracks
+        for u in event_users:
+            uid = u.get("user_id")
+            if uid in unique_user_ids:
+                users_info[uid] = {
+                    "name": u.get("name"),
+                    "email": u.get("email"),
+                    "position": u.get("position"),
+                    "sessions": u.get("sessions", [])
+                }
+
+        # 3. Для отсутствующих пользователей ставим None
+        for uid in unique_user_ids:
+            if uid not in users_info:
+                logging.warning(f"⚠️ В DION нет данных по user_id={uid}")
+                users_info[uid] = None
+
+    except DionApiError as e:
+        logging.error(f"❌ Ошибка DION API: {e}")
+        for uid in unique_user_ids:
+            users_info[uid] = None
+    except Exception as e:
+        logging.error(f"❌ Общая ошибка при запросе пользователей: {e}")
+        for uid in unique_user_ids:
+            users_info[uid] = None
+
     return users_info
+
+
 
 def align_diarization_and_transcript_fast(diarization, transcript_chunks, tracks=None, users_info=None):
     """Быстрое объединение результатов с добавлением user_id из JSON и информации о пользователях"""
@@ -798,7 +872,34 @@ def align_diarization_and_transcript_fast(diarization, transcript_chunks, tracks
     logging.info(f"🎯 Объединено в {len(merged)} сегментов")
     return merged
 
-def send_email(subject: str, body: str, to_email: str = None):  
+def format_segments_to_lines(segments):
+    """
+    Преобразует массив сегментов (список словарей) в построчный текст.
+    
+    :param segments: list[dict] — список сегментов с полями:
+                     - start (float)
+                     - end (float)
+                     - speaker (str, опционально)
+                     - text (str)
+    :return: str — готовая строка в формате:
+               [00:00,72 — 00:10,98] Имя: Текст
+    """
+    def format_time(seconds):
+        mins = int(seconds // 60)
+        secs = seconds % 60
+        return f"{mins:02}:{secs:05.2f}".replace('.', ',')
+
+    lines = []
+    for seg in segments:
+        speaker = seg.get('speaker_name', '').strip() or "Неизвестный"
+        text = seg.get('text', '').strip()
+
+        line = f"{speaker}: {text}"
+        lines.append(line)
+
+    return '\n'.join(lines)
+
+def send_email(subject: str, body: str, to_email: str = None):
     """
     Отправка email
     
@@ -807,24 +908,22 @@ def send_email(subject: str, body: str, to_email: str = None):
         body: Тело письма (может быть HTML)
         to_email: Email получателя (если None, берется из настроек)
     """
-    try:
-        recipient_email = to_email or settings.EMAIL_TO
+    recipient_email = to_email or settings.EMAIL_TO
+    
+    msg = MIMEText(body, 'html' if '<' in body else 'plain', 'utf-8')
+    msg['Subject'] = subject
+    msg['From'] = settings.EMAIL_FROM
+    msg['To'] = recipient_email
+    
+    with smtplib.SMTP(settings.EMAIL_HOST, settings.EMAIL_PORT) as server:
+        if settings.EMAIL_USE_TLS:
+            server.starttls()
+        server.login(settings.EMAIL_USER, decrypt_password(settings.EMAIL_PASS))
+        server.send_message(msg)
+    
+    logging.info(f"📧 Email отправлен: {subject} -> {recipient_email}")
         
-        msg = MIMEText(body, 'html' if '<' in body else 'plain', 'utf-8')
-        msg['Subject'] = subject
-        msg['From'] = settings.EMAIL_FROM
-        msg['To'] = recipient_email
-        logging.info(f"Send msg: {msg}")
-        with smtplib.SMTP(settings.EMAIL_HOST, settings.EMAIL_PORT) as server:
-            if settings.EMAIL_USE_TLS:
-                server.starttls()
-            server.login(settings.EMAIL_USER, settings.EMAIL_PASS)
-            server.send_message(msg)
-        
-        logging.info(f"📧 Email отправлен: {subject} -> {recipient_email}")
-        
-    except Exception as e:
-        logging.error(f"❌ Ошибка при отправке email: {e}")
+    
 
 def create_speaker_to_user_mapping_balanced(diarization_annotation, tracks, transcript_chunks):
     """Балансирует уникальность user_id и уверенность сопоставления"""
@@ -1041,14 +1140,26 @@ def process_directory(s3_prefix):
         users_info = {}
         dion_client = None
         owner_email = None
+        slug = None
 
+        # Берём диапазон по дате события (например ±5 часов)
+        event_id, time_start, time_end = parse_event_path_and_get_range(s3_prefix)
         if settings.DION_API_ENABLED and tracks:
             try:
-                dion_client = DionApiClient(access_token=settings.DION_ACCESS_TOKEN)
+                dion_client = DionApiClient(access_token=decrypt_password(settings.DION_ACCESS_TOKEN))
                 # Собираем все уникальные user_id из треков
                 user_ids = [track['user_id'] for track in tracks if 'user_id' in track]
+
+
                 if user_ids:
-                    users_info = get_users_info(user_ids, dion_client)
+                    users_info = get_users_info(
+                        user_ids=user_ids,
+                        dion_client=dion_client,
+                        event_id=event_id,
+                        time_start=time_start,
+                        time_end=time_end
+                    )
+
                  # ИЗВЛЕКАЕМ UUID события из s3_prefix
                 # s3_prefix имеет формат: uuid/timestamp/
                 event_uuid = extract_event_uuid_from_s3_prefix(s3_prefix)
@@ -1056,13 +1167,13 @@ def process_directory(s3_prefix):
                 if event_uuid:
                     # Получаем информацию о событии
                     event_data = dion_client.get_event_data_by_id(event_uuid)
+                    slug = event_data.get("link_settings", {}).get("slug","")
                     logging.info(f"📋 Получены данные события: {event_uuid}")
                     
                     # Извлекаем owner_email из ответа
-                    if isinstance(event_data, list) and len(event_data) > 0:
-                        event_info = event_data[0]
-                        owner_email = event_info.get('owner_email')
-                        logging.info(f"👤 Owner email: {owner_email}")
+                    if event_data:
+                       owner_email = event_data.get('owner_email')
+                       logging.info(f"👤 Owner email: {owner_email}")
             except Exception as e:
                 logging.error(f"❌ Ошибка при инициализации DION API клиента: {e}")
                 users_info = {}
@@ -1085,21 +1196,14 @@ def process_directory(s3_prefix):
             "directory": s3_prefix,
             "processing_time": round(time.time() - total_start_time, 1)
         }, ensure_ascii=False, indent=2)
-        logging.info(f"Результат: {result_json}")
+        #logging.info(f"Результат: {result_json}")
         
           # ОТПРАВКА РЕЗУЛЬТАТА НА ПОЧТУ
         if owner_email:
-            # Отправляем на owner_email
-            send_email_to_owner(
-                owner_email=owner_email,
-                event_uuid=event_uuid,
-                result_data=result_json,
-                s3_prefix=s3_prefix
-            )
+            send_email(f"расшифровка dion-конференции за {iso8601_to_dd_mm_yyyy(time_start)} комната {slug!r}", format_segments_to_lines(result_segments), to_email=owner_email)
         else:
-            # Резервный вариант - отправка на email из настроек
-            logging.warning("⚠️ Owner email не найден, отправляем на email из настроек")
-            send_email(f"Транскрипция {s3_prefix}", result_json)
+            raise Exception(f"Не найдена почта владельная по {s3_prefix}")
+           
         
         # Удаляем только timestamp директорию из S3 (не всю UUID директорию)
         # s3_prefix имеет формат: uuid/timestamp/
@@ -1146,6 +1250,11 @@ def process_directory(s3_prefix):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+
+def iso8601_to_dd_mm_yyyy(iso_date_str: str) -> str:
+    dt = datetime.strptime(iso_date_str, "%Y-%m-%dT%H:%M:%SZ")
+    return dt.strftime("%d.%m.%Y")
+
 def extract_event_uuid_from_s3_prefix(s3_prefix: str) -> Optional[str]:
     """
     Извлекает UUID события из S3 пути.
@@ -1185,7 +1294,7 @@ def extract_event_uuid_from_s3_prefix(s3_prefix: str) -> Optional[str]:
         return None
 
 
-def send_email_to_owner(owner_email: str, event_uuid: str, result_data: dict, s3_prefix: str):
+def send_email_to_owner(owner_email: str, event_uuid: str, result_data: dict, s3_prefix: str, date: str):
     """
     Отправляет результат транскрипции на email владельца события.
     
@@ -1196,101 +1305,77 @@ def send_email_to_owner(owner_email: str, event_uuid: str, result_data: dict, s3
         s3_prefix: Исходный S3 префикс
     """
     try:
-        # Формируем читабельное содержимое email
-        segments = result_data.get("segments", [])
-        total_duration = result_data.get("total_duration", 0)
-        processing_time = result_data.get("processing_time", 0)
-        
-        # Статистика по спикерам
-        speaker_stats = {}
-        user_stats = {}
-        
+       
+
         for segment in segments:
             speaker = segment.get("speaker", "unknown")
             user_id = segment.get("user_id")
-            
+
             speaker_stats[speaker] = speaker_stats.get(speaker, 0) + 1
             if user_id:
                 user_stats[user_id] = user_stats.get(user_id, 0) + 1
-        
-        # Формируем текст email
-        subject = f"✅ Транскрипция завершена: событие {event_uuid[:8]}..."
-        
-        body = f"""
-<h2>Транскрипция аудио завершена</h2>
 
-<p><strong>Событие:</strong> {event_uuid}</p>
-<p><strong>Директория:</strong> {s3_prefix}</p>
-<p><strong>Длительность аудио:</strong> {total_duration:.1f} сек</p>
-<p><strong>Время обработки:</strong> {processing_time:.1f} сек</p>
+        # Формируем тему письма
+        subject = f"расшифровка dion-конференции за {date}"
 
-<h3>📊 Статистика:</h3>
-<ul>
-    <li>Всего сегментов: {len(segments)}</li>
-    <li>Обнаружено спикеров: {len(speaker_stats)}</li>
-    <li>Идентифицировано пользователей: {len(user_stats)}</li>
-</ul>
+        # Формируем тело письма (HTML)
+        body = f""""""
 
-<h3>🎯 Распределение по спикерам:</h3>
-"""
-        
         # Добавляем статистику по спикерам
         for speaker, count in sorted(speaker_stats.items(), key=lambda x: x[1], reverse=True):
             user_id = next((seg.get('user_id') for seg in segments if seg.get('speaker') == speaker), None)
             user_info = next((seg.get('user_info') for seg in segments if seg.get('speaker') == speaker), None)
-            
+
             user_display = ""
             if user_info:
                 user_display = f" ({user_info.get('name', user_info.get('email', user_id))})"
             elif user_id:
                 user_display = f" (user_id: {user_id})"
-                
+
             body += f"<li>{speaker}: {count} сегментов{user_display}</li>\n"
-        
+
         # Добавляем примеры сегментов
         body += f"""
 <h3>📝 Примеры транскрипции (первые 5 сегментов):</h3>
 """
-        
+
         for i, segment in enumerate(segments[:5]):
-            start_time = segment.get('start', 0)
-            end_time = segment.get('end', 0)
             speaker = segment.get('speaker', 'unknown')
             text = segment.get('text', '')
-            
-            # Форматируем время (минуты:секунды)
-            start_formatted = f"{int(start_time // 60):02d}:{int(start_time % 60):02d}"
-            end_formatted = f"{int(end_time // 60):02d}:{int(end_time % 60):02d}"
-            
+
+
             body += f"""
 <div style="margin-bottom: 10px; padding: 10px; background: #f5f5f5; border-radius: 5px;">
-    <strong>{start_formatted} - {end_formatted}</strong> [{speaker}]:<br/>
-    {text}
+    <strong> {speaker}: {text}
 </div>
 """
+
         
-        if len(segments) > 5:
-            body += f"<p>... и еще {len(segments) - 5} сегментов</p>"
-        
+
         body += f"""
 <hr/>
 <p><em>Обработано системой транскрипции Dion</em></p>
-<p><small>Event UUID: {event_uuid}</small></p>
 """
-        
-        # Отправляем email
-        send_email(subject, body, to_email=owner_email)
+
+        # Отправляем письмо через общий метод
+        send_email(subject=subject, body=body, to_email=owner_email)
         logging.info(f"📧 Результат отправлен на email владельца: {owner_email}")
-        
+
     except Exception as e:
         logging.error(f"❌ Ошибка при отправке email владельцу {owner_email}: {e}")
-        # Резервно отправляем на email из настроек
+        # Резервная отправка
         fallback_subject = f"Транскрипция {s3_prefix}"
         fallback_body = json.dumps(result_data, ensure_ascii=False, indent=2)
-        send_email(fallback_subject, fallback_body)
+        send_email(subject=fallback_subject, body=fallback_body)
 
 # ------------------- Фоновый цикл -------------------
 async def background_loop():
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.empty_cache()
+    print("PyTorch version:", torch.__version__)
+    print("CUDA available:", torch.cuda.is_available())
+    print("CUDA version:", torch.version.cuda)
+    print("GPU name:", torch.cuda.get_device_name(0))
     """Фоновый цикл для обработки директорий UUID/timestamp с параллельной обработкой"""
     processed_dirs = set()
     executor = ThreadPoolExecutor(max_workers=settings.PARALLEL_WORKERS)
@@ -1303,8 +1388,8 @@ async def background_loop():
             response = s3.list_objects_v2(Bucket=settings.S3_BUCKET, Delimiter='/')
             uuid_prefixes = response.get("CommonPrefixes", [])
             
-            if uuid_prefixes:
-                logging.info(f"📁 Найдено UUID директорий: {len(uuid_prefixes)}")
+            #if uuid_prefixes:
+            #    logging.info(f"📁 Найдено UUID директорий: {len(uuid_prefixes)}")
             
             # Собираем все директории для обработки
             directories_to_process = []
@@ -1322,7 +1407,7 @@ async def background_loop():
                 timestamp_prefixes = timestamp_response.get("CommonPrefixes", [])
                 
                 if not timestamp_prefixes:
-                    logging.info(f"📭 В UUID директории {uuid_prefix} не найдено timestamp директорий")
+                    #logging.info(f"📭 В UUID директории {uuid_prefix} не найдено timestamp директорий")
                     continue
                 
                 for timestamp_prefix_obj in timestamp_prefixes:
@@ -1338,6 +1423,10 @@ async def background_loop():
                     if len(parts) >= 2:
                         uuid_part = parts[-2]
                         timestamp_part = parts[-1]
+
+                        if uuid_part not in settings.UUID_WHITELIST:
+                            #logging.info(f"⚠️ UUID {uuid_part} не в белом списке, пропускаем")
+                            continue
                         
                         # Проверяем, что это похоже на UUID и timestamp
                         if len(uuid_part) == 36 and 'T' in timestamp_part:
@@ -1386,8 +1475,6 @@ async def background_loop():
                         logging.info(f"✅ Завершена обработка: {timestamp_prefix}")
                     except Exception as e:
                         logging.error(f"❌ Ошибка при обработке {timestamp_prefix}: {e}")
-                        # Все равно помечаем как обработанную, чтобы не зациклиться
-                        processed_dirs.add(timestamp_prefix)
             else:
                 # Логируем, почему не найдено директорий для обработки
                 if uuid_prefixes:
@@ -1402,6 +1489,33 @@ async def background_loop():
             await asyncio.sleep(30)
         
         await asyncio.sleep(settings.CHECK_INTERVAL)
+
+def patch_torch_for_weights_only():
+    """Патч для совместимости с PyTorch 2.6+"""
+    try:
+        # Проверяем версию PyTorch
+        torch_version = torch.__version__
+        logging.info(f"🔧 PyTorch version: {torch_version}")
+        
+        # Для версий 2.6 и выше
+        if tuple(map(int, torch_version.split('.')[:2])) >= (2, 6):
+            logging.info("🎯 Применяем патч для PyTorch 2.6+ (weights_only=False)")
+            
+            # Переопределяем метод загрузки для безопасной загрузки
+            original_load = torch.load
+            
+            def patched_load(f, map_location=None, pickle_module=None, 
+                           weights_only=None, **kwargs):
+                # Всегда используем weights_only=False для моделей
+                return original_load(f, map_location=map_location, 
+                                   pickle_module=pickle_module,
+                                   weights_only=False, **kwargs)
+            
+            torch.load = patched_load
+            logging.info("✅ Патч применен успешно")
+            
+    except Exception as e:
+        logging.warning(f"⚠️ Не удалось применить патч для PyTorch: {e}")
 
 @app.on_event("startup")
 async def startup_event():

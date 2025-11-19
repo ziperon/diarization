@@ -129,6 +129,39 @@ class DionApiClient:
         resp = self._request("GET", f"events/{event_id}")
         return resp.json()
 
+    def get_event_users(
+        self,
+        event_id: str,
+        *,
+        time_start: Optional[str] = None,
+        time_end: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Получить список пользователей события за период.
+
+        Endpoint:
+            GET /events/{event_id}/users?time_start=...&time_end=...
+
+        Args:
+            event_id: UUID события
+            time_start: ISO8601 (например '2025-11-10T11:00:00Z')
+            time_end: ISO8601 (например '2025-11-10T15:00:00Z')
+
+        Returns:
+            Список пользователей с данными их участия.
+        """
+        params: Dict[str, Any] = {}
+
+        if time_start is not None:
+            params["time_start"] = time_start
+
+        if time_end is not None:
+            params["time_end"] = time_end
+
+        path = f"events/{event_id}/users"
+        resp = self._request("GET", path, params=params)
+        return resp.json()
+
     # Conferences: POST /events
     def create_event(
         self,
