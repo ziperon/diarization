@@ -16,16 +16,23 @@ import soundfile as sf
 from fastapi import FastAPI
 import boto3
 import torch
+import numpy as np
+try:
+    setattr(np, "NaN", np.nan)
+    setattr(np, "NAN", np.nan)
+except Exception:
+    pass
 from pyannote.audio import Pipeline
 import whisper  # ← ДОБАВИТЬ прямой импорт
+from gigaam_integration import GigaAMRecognizer
 from dion_client import DionApiClient, DionApiError
 import settings
 import requests
 from huggingface_hub import snapshot_download
 from datetime import datetime, timedelta
 import warnings
-from crypto import encrypt_password, decrypt_password
-
+from crypto import decrypt_password
+from botocore.exceptions import ClientError, EndpointConnectionError
 
 warnings.filterwarnings("ignore")
 
@@ -37,19 +44,24 @@ os.environ["HTTPS_PROXY"] = ""
 # ------------------- Логирование -------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 # ------------------- S3 -------------------
-s3 = boto3.client(
-    "s3",
-    endpoint_url='https://10.76.50.8:9000',
-    aws_access_key_id=decrypt_password(settings.AWS_ACCESS_KEY_ID),
-    aws_secret_access_key=decrypt_password(settings.AWS_SECRET_ACCESS_KEY),
-    verify = False,
-    region_name='us-east-1'
-)
-try:
-    s3.list_buckets()
-    print("✅ Успешно подключились к MinIO!")
-except ClientError as e:
-    print("❌ Ошибка подключения:", e.response['Error']['Code'], e.response['Error']['Message'])
+s3 = None
+if getattr(settings, "S3_ENABLED", False):
+    try:
+        s3 = boto3.client(
+            "s3",
+            endpoint_url='http://localhost:9000',
+            aws_access_key_id="minioadmin",
+            aws_secret_access_key="minioadmin",
+            verify=False,
+            region_name='us-east-1'
+        )
+        s3.list_buckets()
+        logging.info("✅ Успешно подключились к MinIO!")
+    except (ClientError, EndpointConnectionError) as e:
+        logging.warning(f"❌ Ошибка подключения к MinIO: {e}. Продолжаем без S3")
+        s3 = None
+else:
+    logging.info("S3/MinIO отключен (S3_ENABLED=0)")
 
 # ------------------- FastAPI -------------------
 app = FastAPI()
@@ -131,17 +143,18 @@ def load_pyannote_fast():
             from torch.torch_version import TorchVersion
             from pyannote.audio.core.task import Specifications
             with torch.serialization.safe_globals([TorchVersion, Specifications]):
-            	pipeline = Pipeline.from_pretrained(
+                pipeline = Pipeline.from_pretrained(
                     settings.PYANNOTE_MODEL,
                     cache_dir=settings.MODELS_DIR,
-		    local_files_only=True
+                    local_files_only=True
                 )
         except (ImportError, AttributeError, TypeError) as e:
             # Если контекстный менеджер не поддерживается, загружаем обычным способом
             logging.debug(f"Контекстный менеджер не поддерживается, используем обычную загрузку: {e}")
-       	    pipeline = Pipeline.from_pretrained(
-               	settings.PYANNOTE_MODEL,
-               	cache_dir=settings.MODELS_DIR
+            pipeline = Pipeline.from_pretrained(
+                settings.PYANNOTE_MODEL,
+                cache_dir=settings.MODELS_DIR,
+                use_auth_token="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"
             )
         
         device_type = PerformanceOptimizer.get_available_device()
@@ -226,8 +239,23 @@ def load_whisper_fast():
         logging.error(f"❌ Ошибка загрузки Whisper: {e}")
         raise
 
+def load_gigaam_fast():
+    """Оптимизированная загрузка GigaAM"""
+    logging.info("🔄 Загружаем GigaAM v3...")
+    start_time = time.time()
+    try:
+        device_type = PerformanceOptimizer.get_available_device()
+        recognizer = GigaAMRecognizer(model_type=settings.GIGAAM_MODEL_TYPE, device=device_type)
+        recognizer.load_model()
+        PerformanceOptimizer.log_processing_time(start_time, "Загрузка GigaAM")
+        return recognizer, device_type
+    except Exception as e:
+        logging.error(f"❌ Ошибка загрузки GigaAM: {e}")
+        # raise
+
 # Глобальные переменные для моделей
 diarization_pipeline = None
+gigaam_recognizer = None
 whisper_model = None
 device = None
 # Lock для синхронизации доступа к моделям при параллельной обработке
@@ -235,15 +263,15 @@ models_lock = threading.Lock()
 
 def initialize_models_fast():
     """Быстрая инициализация моделей"""
-    global diarization_pipeline, whisper_model, device
+    global diarization_pipeline, gigaam_recognizer, whisper_model, device
     
-    if diarization_pipeline is None or whisper_model is None:
+    if diarization_pipeline is None or (gigaam_recognizer is None and whisper_model is None):
         preload_all_models()
 
 def preload_all_models():
     """Предварительная загрузка всех моделей"""
     logging.info("🔄 Предзагрузка всех моделей...")
-    global diarization_pipeline, whisper_model, device
+    global diarization_pipeline, gigaam_recognizer, whisper_model, device
 
     patch_torch_for_weights_only()
 
@@ -251,68 +279,102 @@ def preload_all_models():
     device_type = PerformanceOptimizer.get_available_device()
     
     diarization_pipeline = load_pyannote_fast()
-    whisper_model, device = load_whisper_fast()
+    # Primary: GigaAM
+    gigaam_recognizer, device = load_gigaam_fast()
+    # Fallback: Whisper (не критично, если не загрузится)
+    # try:
+    #     whisper_model, _ = load_whisper_fast()
+    # except Exception as e:
+    #     logging.warning(f"⚠️ Whisper fallback недоступен: {e}")
     
     logging.info("✅ Все модели предзагружены")
 
+def _format_segments_from_gigaam(result: dict):
+    result_text = " ".join(seg.get("text", "") for seg in result.get("segments", [])) or result.get("text", "")
+    result_chunks = []
+    for seg in result.get("segments", []):
+        result_chunks.append({
+            "timestamp": [seg.get("start", 0), seg.get("end", 0)],
+            "text": seg.get("text", "").strip()
+        })
+    return result_text.strip(), result_chunks
+
+def _transcribe_with_whisper(audio_path: str):
+    if settings.TRANSCRIPTION_MODE == "quality":
+        result = whisper_model.transcribe(
+            audio_path,
+            language="ru",
+            fp16=True,
+            word_timestamps=True,
+            beam_size=5,
+            best_of=5,
+            temperature=0,
+            no_speech_threshold=0.6,
+            compression_ratio_threshold=2.4,
+            condition_on_previous_text=False,
+            logprob_threshold=-1.0,
+            initial_prompt="Это запись разговора на русском языке. "
+        )
+    else:
+        result = whisper_model.transcribe(
+            audio_path,
+            language="ru",
+            fp16=True,
+            word_timsestamps=True,
+            beam_size=3,
+            best_of=2,
+            temperature=0.0,
+            no_speech_threshold=0.6,
+            compression_ratio_threshold=2.4,
+            condition_on_previous_text=False,
+        )
+    result_text = ""
+    result_chunks = []
+    for segment in result["segments"]:
+        result_text += segment["text"] + " "
+        result_chunks.append({
+            "timestamp": [segment["start"], segment["end"]],
+            "text": segment["text"].strip()
+        })
+    return result_text.strip(), result_chunks
+
+def _transcribe_with_gigaam(audio_path: str):
+    result = gigaam_recognizer.transcribe(audio_path, language="ru")
+    return _format_segments_from_gigaam(result)
+
 # ------------------- ОПТИМИЗИРОВАННАЯ транскрипция -------------------
 def transcribe_optimized(audio_path):
-    """ОПТИМИЗИРОВАННАЯ транскрипция с настраиваемым качеством"""
-    logging.info(f"🎧 Транскрипция (режим: {settings.TRANSCRIPTION_MODE})...")
+    """ОПТИМИЗИРОВАННАЯ транскрипция с приоритетом GigaAM и fallback на Whisper"""
+    logging.info(f"🎧 Транскрипция (primary: {settings.ASR_PRIMARY})...")
     start_time = time.time()
 
+    def try_gigaam():
+        if gigaam_recognizer is None:
+            raise RuntimeError("GigaAM не инициализирован")
+        return _transcribe_with_gigaam(audio_path)
+
+    def try_whisper():
+        if whisper_model is None:
+            raise RuntimeError("Whisper не инициализирован")
+        return _transcribe_with_whisper(audio_path)
+
     try:
-        # Настройки в зависимости от режима
-        if settings.TRANSCRIPTION_MODE == "quality":
-            # НАСТРОЙКИ ДЛЯ МАКСИМАЛЬНОГО КАЧЕСТВА
-            logging.info("✨ Используем режим высокого качества")
-            result = whisper_model.transcribe(
-                audio_path,
-                language="ru",
-                fp16=True,  # ВКЛЮЧАЕМ FP16 (2x ускорение на GPU)
-                word_timestamps=True,  # Нужно для диаризации
-                beam_size=5,  # ↑ Увеличено для лучшего качества (было 3)
-                best_of=5,    # ↑ Увеличено для лучшего качества (было 2)
-                temperature=0,  # Temperature fallback для лучшего качества
-                no_speech_threshold=0.6,  # Лучше определяет речь
-                compression_ratio_threshold=2.4,  # Фильтрация шума
-                condition_on_previous_text=False,  # ↑ Включено для лучшего контекста
-                logprob_threshold=-1.0,  # Фильтрация низкокачественных сегментов
-                initial_prompt="Это запись разговора на русском языке. "  # Подсказка для лучшего распознавания
-            )
+        if settings.ASR_PRIMARY == "gigaam":
+            full_text, chunks = try_gigaam()
+            logging.info(f"✅ GigaAM транскрипция завершена за {time.time() - start_time:.1f} сек")
+            logging.info(f"Text: {full_text} Chunk: {chunks}")
         else:
-            # НАСТРОЙКИ ДЛЯ СКОРОСТИ (по умолчанию)s
-            logging.info("⚡ Используем режим скорости")
-            result = whisper_model.transcribe(
-                audio_path,
-                language="ru",
-                fp16=True,  # ВКЛЮЧАЕМ FP16 (2x ускорение на GPU)
-                word_timsestamps=True,  # Нужно для диаризации
-                beam_size=3,  # ↓ уменьшаем для скорости
-                best_of=2,    # ↓ уменьшаем для скорости  
-                temperature=0.0,  # Более стабильные результаты
-                no_speech_threshold=0.6,  # Лучше определяет речь
-                compression_ratio_threshold=2.4,  # Фильтрация шума
-                condition_on_previous_text=False,  # ↑ ускоряет длинные аудио
-            )
-        
-        result_text = ""
-        result_chunks = []
+            full_text, chunks = try_whisper()
+    except Exception as primary_err:
+        logging.warning(f"⚠️ Primary ASR failed: {primary_err}. Пытаемся fallback...")
+        if settings.ASR_PRIMARY == "gigaam":
+            full_text, chunks = try_whisper()
+        else:
+            full_text, chunks = try_gigaam()
 
-        for segment in result["segments"]:
-            result_text += segment["text"] + " "
-            result_chunks.append({
-                "timestamp": [segment["start"], segment["end"]],
-                "text": segment["text"].strip()
-            })
-
-        PerformanceOptimizer.log_processing_time(start_time, "Транскрипция")
-        logging.info(f"📝 Транскрибировано: {len(result_text)} символов, {len(result_chunks)} сегментов")
-        return result_text.strip(), result_chunks
-
-    except Exception as e:
-        logging.error(f"❌ Ошибка транскрипции: {e}")
-        raise
+    PerformanceOptimizer.log_processing_time(start_time, "Транскрипция")
+    logging.info(f"📝 Транскрибировано: {len(full_text)} символов, {len(chunks)} сегментов")
+    return full_text, chunks
 
 # ------------------- ОПТИМИЗИРОВАННАЯ обработка -------------------
 def process_audio_optimized(audio_path, tracks=None, users_info=None):
@@ -321,7 +383,7 @@ def process_audio_optimized(audio_path, tracks=None, users_info=None):
     start_time = time.time()
     
     # Проверяем инициализацию моделей (PyTorch модели thread-safe для inference)
-    if diarization_pipeline is None or whisper_model is None:
+    if diarization_pipeline is None or (gigaam_recognizer is None and whisper_model is None):
         raise ValueError("Модели не инициализированы")
 
     # Очищаем кеш CUDA перед обработкой
@@ -1200,6 +1262,7 @@ def process_directory(s3_prefix):
         
           # ОТПРАВКА РЕЗУЛЬТАТА НА ПОЧТУ
         if owner_email:
+            logging.info(f"Отправка результата на почту {format_segments_to_lines(result_segments)}")
             send_email(f"расшифровка dion-конференции за {iso8601_to_dd_mm_yyyy(time_start)} комната {slug!r}", format_segments_to_lines(result_segments), to_email=owner_email)
         else:
             raise Exception(f"Не найдена почта владельная по {s3_prefix}")
@@ -1370,6 +1433,9 @@ def send_email_to_owner(owner_email: str, event_uuid: str, result_data: dict, s3
 
 # ------------------- Фоновый цикл -------------------
 async def background_loop():
+    if s3 is None:
+        logging.info("S3 отключен или недоступен: фоновый цикл не запускается")
+        return
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.empty_cache()
     print("PyTorch version:", torch.__version__)
@@ -1522,8 +1588,11 @@ async def startup_event():
     """Запуск фоновой задачи при старте"""
     logging.info("🚀 Предзагрузка моделей...")
     preload_all_models()
-    logging.info("🚀 Запуск оптимизированного фонового цикла...")
-    asyncio.create_task(background_loop())
+    if s3 is not None:
+        logging.info("🚀 Запуск оптимизированного фонового цикла...")
+        asyncio.create_task(background_loop())
+    else:
+        logging.info("⏭ Фоновый цикл не запущен: S3 отключен или недоступен")
 
 @app.get("/")
 def read_root():
@@ -1549,4 +1618,7 @@ def health_check():
     }
 
 if __name__ == "__main__":
-    asyncio.run(background_loop())
+    if s3 is not None:
+        asyncio.run(background_loop())
+    else:
+        logging.info("S3 отключен или недоступен: выход без запуска фонового цикла")

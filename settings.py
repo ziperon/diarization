@@ -1,7 +1,8 @@
 import os
 
 
-S3_BUCKET = "dionrecord"
+S3_BUCKET = "diarization-files"
+S3_ENABLED = os.getenv("S3_ENABLED", "1") == "1"
 LOCAL_TMP = "./tmp/audiot"
 CHECK_INTERVAL = 10
 SUPPORTED_EXT = ['mp3', 'm4a', 'wav', 'flac']
@@ -32,6 +33,9 @@ PYANNOTE_MODEL = os.getenv("PYANNOTE_MODEL", "pyannote/speaker-diarization-3.1")
 WHISPER_MODEL = "large-v3"  # ← ИСПОЛЬЗУЕМ large-v2 (быстрее чем v3)
 # Режим качества транскрипции: "fast" (скорость) или "quality" (качество)
 TRANSCRIPTION_MODE = os.getenv("TRANSCRIPTION_MODE", "quality").lower()  # По умолчанию качество
+# Основной ASR и параметры GigaAM
+GIGAAM_MODEL_TYPE = os.getenv("GIGAAM_MODEL_TYPE", "v3_rnnt")
+ASR_PRIMARY = os.getenv("ASR_PRIMARY", "gigaam")  # "gigaam" | "whisper"
 
 # Параметры диаризации для улучшения разделения спикеров
 # Порог кластеризации: меньше значение = больше спикеров (по умолчанию 0.704, для лучшего разделения используйте 0.5-0.65)
@@ -61,5 +65,6 @@ UUID_WHITELIST = [
     "355f027c-6aa6-4d91-b687-10cd56df5954", #https://dion.vc/event/ciooffice-sergeybelousov
     "ea0230d6-2344-486c-b6f9-acbc55fcc636", #https://dion.vc/event/olga-senyushkina
     "82e09417-a9c9-46fe-b534-46bae14b23ef",
-    "9fcf1a91-3c89-437e-ae9d-6a4e9d1a8f6d" #https://dion.vc/event/natalia-solodova
+    "9fcf1a91-3c89-437e-ae9d-6a4e9d1a8f6d", #https://dion.vc/event/natalia-solodova
+    "f6c28cf1-4c6c-44b4-a670-35158d9798a1"
 ]

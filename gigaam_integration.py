@@ -2,12 +2,17 @@
 import torch
 import torchaudio
 import numpy as np
+if not hasattr(np, "NaN"):
+    np.NaN = np.nan
+
 from typing import Dict, List, Optional, Union
 import logging
 from pathlib import Path
 import os
 import gigaam
-from gigaam.utils import format_time  # Import format_time for timestamp formatting
+import settings
+import time
+import threading
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -28,35 +33,56 @@ class GigaAMRecognizer:
         self.model = None
         self.sampling_rate = 16000  # GigaAM uses 16kHz audio
         
-        # RNNT-v3 specific configuration
-        self.supported_models = {
-            "e2e_rnnt": f"v3_e2e_rnnt",  # RNNT-v3 model
-            "ctc": "v3_ctc",             # CTC model (alternative)
-            "ssl": "v3_ssl"              # Self-supervised model
-        }
-        
-        if model_type not in self.supported_models:
-            logging.warning(f"Model type '{model_type}' not recognized. Defaulting to 'e2e_rnnt'")
-            self.model_type = "e2e_rnnt"
+       
         
     def load_model(self):
-        """Load the GigaAM RNNT-v3 model."""
+        """Load the GigaAM model with timeout and fallback to 'ctc' if needed."""
         try:
-            model_name = self.supported_models[self.model_type]
-            logging.info(f"🔄 Loading GigaAM {model_name} on {self.device}")
-            
-            # Load the model
-            self.model = gigaam.load_model(model_name)
-            
+            selected = self.model_type
+            timeout_s = getattr(settings, "GIGAAM_LOAD_TIMEOUT", 30)
+            logging.info(f"🔄 Loading GigaAM {selected} on {self.device} (timeout={timeout_s}s)")
+            t0 = time.time()
+
+            result = {"model": None, "err": None}
+
+            def _load(kind: str):
+                try:
+                    logging.info(f"📥 Starting gigaam.load_model({kind})")
+                    result["model"] = gigaam.load_model(kind)
+                except Exception as e:
+                    result["err"] = e
+
+            used = selected
+            th = threading.Thread(target=_load, args=(selected,), daemon=True)
+            th.start()
+            th.join(timeout_s)
+
+            if result["model"] is None:
+                logging.warning(f"⚠️ gigaam.load_model({selected}) did not complete within {timeout_s}s or errored: {result['err']}")
+                if selected != "ctc":
+                    used = "ctc"
+                    result = {"model": None, "err": None}
+                    logging.info("↪️ Falling back to 'ctc'")
+                    th = threading.Thread(target=_load, args=(used,), daemon=True)
+                    th.start()
+                    th.join(timeout_s)
+
+            if result["model"] is None:
+                raise RuntimeError(f"Failed to load GigaAM model '{selected}' and fallback 'ctc'")
+
+            self.model = result["model"]
+            logging.info(f"📥 gigaam.load_model({used}) finished in {time.time()-t0:.1f}s")
+
             # Move to device if CUDA is available
             if "cuda" in self.device and torch.cuda.is_available():
+                t1 = time.time()
                 self.model = self.model.cuda()
-                logging.info("✅ Model moved to GPU")
+                logging.info(f"✅ Model moved to GPU in {time.time()-t1:.1f}s")
             else:
                 logging.info("ℹ️ Using CPU for inference")
-                
-            logging.info(f"✅ GigaAM {model_name} loaded successfully")
-            
+
+            logging.info(f"✅ GigaAM {used} loaded successfully (total {time.time()-t0:.1f}s)")
+
         except Exception as e:
             logging.error(f"❌ Error loading GigaAM model: {str(e)}")
             raise
@@ -82,16 +108,22 @@ class GigaAMRecognizer:
             self.load_model()
             
         try:
+            logging.info(f"🧪 Preparing to transcribe: {audio_path}")
             # Check if we need to handle long-form audio
+            t0 = time.time()
             duration = self._get_audio_duration(audio_path)
             is_long_audio = duration > 25.0  # GigaAM's short-form limit is 25 seconds
             
-            logging.info(f"🎧 Transcribing {'long' if is_long_audio else 'short'} audio: {os.path.basename(audio_path)}")
+            logging.info(f"🎧 Transcribing {'long' if is_long_audio else 'short'} audio: {os.path.basename(audio_path)} (dur={duration:.2f}s)")
             
             if is_long_audio:
-                return self._transcribe_long(audio_path, language)
+                res = self._transcribe_long(audio_path, language)
+                logging.info(f"✅ Long-form transcription finished in {time.time()-t0:.1f}s")
+                return res
             else:
-                return self._transcribe_short(audio_path, language, duration)
+                res = self._transcribe_short(audio_path, language, duration)
+                logging.info(f"✅ Short-form transcription finished in {time.time()-t0:.1f}s")
+                return res
             
         except Exception as e:
             logging.error(f"❌ Error during transcription: {str(e)}")
@@ -100,7 +132,10 @@ class GigaAMRecognizer:
     def _transcribe_short(self, audio_path: str, language: str, duration: float) -> Dict:
         """Transcribe short audio (up to 25 seconds)."""
         try:
+            logging.info("▶️ GigaAM _transcribe_short: calling model.transcribe(...) ")
+            t0 = time.time()
             text = self.model.transcribe(audio_path)
+            logging.info(f"⏱ model.transcribe finished in {time.time()-t0:.1f}s")
             return {
                 "text": text,
                 "language": language,
@@ -147,6 +182,7 @@ class GigaAMRecognizer:
     def _get_audio_duration(self, audio_path: str) -> float:
         """Get the duration of an audio file in seconds."""
         try:
+            logging.info(f"ℹ️ Reading audio info via torchaudio: {audio_path}")
             info = torchaudio.info(audio_path)
             return info.num_frames / info.sample_rate
         except Exception as e:
