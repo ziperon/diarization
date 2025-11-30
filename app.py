@@ -17,6 +17,7 @@ from fastapi import FastAPI
 import boto3
 import torch
 import numpy as np
+import torchaudio
 try:
     setattr(np, "NaN", np.nan)
     setattr(np, "NAN", np.nan)
@@ -24,7 +25,7 @@ except Exception:
     pass
 from pyannote.audio import Pipeline
 import whisper  # ← ДОБАВИТЬ прямой импорт
-from gigaam_integration import GigaAMRecognizer
+from gigaam_integration import GigaAMRecognizer, GigaAM3Diarizer
 from dion_client import DionApiClient, DionApiError
 import settings
 import requests
@@ -38,8 +39,6 @@ warnings.filterwarnings("ignore")
 
 os.makedirs(settings.LOCAL_TMP, exist_ok=True)
 os.makedirs(settings.MODELS_DIR, exist_ok=True)
-os.environ["HTTP_PROXY"] = ""
-os.environ["HTTPS_PROXY"] = ""
 
 # ------------------- Логирование -------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -49,10 +48,10 @@ if getattr(settings, "S3_ENABLED", False):
     try:
         s3 = boto3.client(
             "s3",
-            endpoint_url='http://localhost:9000',
-            aws_access_key_id="minioadmin",
-            aws_secret_access_key="minioadmin",
-            verify=False,
+            endpoint_url='https://10.76.50.8:9000',
+            aws_access_key_id=decrypt_password(settings.AWS_ACCESS_KEY_ID),
+            aws_secret_access_key=decrypt_password(settings.AWS_SECRET_ACCESS_KEY),
+            verify = False,
             region_name='us-east-1'
         )
         s3.list_buckets()
@@ -113,6 +112,7 @@ def convert_to_wav_fast(input_path):
             "-ar", "16000",
             "-ac", "1",
             "-acodec", "pcm_s16le",
+            "-filter:a", "loudnorm=I=-17:TP=-1.5:LRA=11",
             "-threads", "4",  # ↑ многопоточность
             "-hide_banner",
             "-loglevel", "error",
@@ -143,18 +143,17 @@ def load_pyannote_fast():
             from torch.torch_version import TorchVersion
             from pyannote.audio.core.task import Specifications
             with torch.serialization.safe_globals([TorchVersion, Specifications]):
-                pipeline = Pipeline.from_pretrained(
+            	pipeline = Pipeline.from_pretrained(
                     settings.PYANNOTE_MODEL,
                     cache_dir=settings.MODELS_DIR,
-                    local_files_only=True
+		    local_files_only=True
                 )
         except (ImportError, AttributeError, TypeError) as e:
             # Если контекстный менеджер не поддерживается, загружаем обычным способом
             logging.debug(f"Контекстный менеджер не поддерживается, используем обычную загрузку: {e}")
-            pipeline = Pipeline.from_pretrained(
-                settings.PYANNOTE_MODEL,
-                cache_dir=settings.MODELS_DIR,
-                use_auth_token="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"
+       	    pipeline = Pipeline.from_pretrained(
+               	settings.PYANNOTE_MODEL,
+               	cache_dir=settings.MODELS_DIR
             )
         
         device_type = PerformanceOptimizer.get_available_device()
@@ -216,6 +215,27 @@ def load_pyannote_fast():
     except Exception as e:
         logging.error(f"❌ Ошибка загрузки pyannote: {e}")
         raise
+    
+    
+def get_user_id_majority_overlap(tracks, start_time, end_time):
+    """Назначает один user_id на сегмент по максимальному суммарному перекрытию в окне [start,end]."""
+    start_ms = int(start_time * 1000)
+    end_ms = int(end_time * 1000)
+    if end_ms <= start_ms:
+        return None
+    scores = {}
+    for t in tracks or []:
+        os = max(start_ms, t['start_ms'])
+        oe = min(end_ms, t['end_ms'])
+        ov = max(0, oe - os)
+        if ov <= 0:
+            continue
+        uid = t['user_id']
+        scores[uid] = scores.get(uid, 0) + ov
+    if not scores:
+        return None
+    return max(scores.items(), key=lambda x: x[1])[0]
+
 
 def load_whisper_fast():
     """Оптимизированная загрузка Whisper"""
@@ -282,10 +302,10 @@ def preload_all_models():
     # Primary: GigaAM
     gigaam_recognizer, device = load_gigaam_fast()
     # Fallback: Whisper (не критично, если не загрузится)
-    # try:
-    #     whisper_model, _ = load_whisper_fast()
-    # except Exception as e:
-    #     logging.warning(f"⚠️ Whisper fallback недоступен: {e}")
+    try:
+        whisper_model, _ = load_whisper_fast()
+    except Exception as e:
+        logging.warning(f"⚠️ Whisper fallback недоступен: {e}")
     
     logging.info("✅ Все модели предзагружены")
 
@@ -367,7 +387,7 @@ def transcribe_optimized(audio_path):
             full_text, chunks = try_whisper()
     except Exception as primary_err:
         logging.warning(f"⚠️ Primary ASR failed: {primary_err}. Пытаемся fallback...")
-        if settings.ASR_PRIMARY == "gigaam":
+        if settings.ASR_PRIMARY == "whisper":
             full_text, chunks = try_whisper()
         else:
             full_text, chunks = try_gigaam()
@@ -409,8 +429,77 @@ def process_audio_optimized(audio_path, tracks=None, users_info=None):
             }
         }
         try:
+            max_speakers_count = len([track['user_id'] for track in tracks if 'user_id' in track])
             # Пытаемся передать параметры через kwargs
-            diarization_result[0] = diarization_pipeline(audio_path, **diarization_params)
+            diarizer = GigaAM3Diarizer(gigamodel=gigaam_recognizer.model, hf_token=os.getenv("HF_TOKEN"))
+            
+            diarization_result[0] = diarizer.diarize_and_transcribe(audio_path)
+            # Опционально: распознавать ПО СЕГМЕНТАМ ДИАРИЗАЦИИ (исключить склейку спикеров)
+            try:
+                if settings.ASR_PRIMARY == "gigaam" and settings.ASR_SEGMENT_BY_DIARIZATION == 1:
+                    logging.info("🔀 ASR по сегментам диаризации: включено")
+                    diarization_annotation = diarization_result[0] if isinstance(diarization_result, list) and len(diarization_result) > 0 else diarization_result
+                    if diarization_annotation is None:
+                        raise ValueError("diarization_annotation is None; cannot segment ASR by diarization")
+                    # Поддерживаем два формата: Annotation.itertracks или список сегментов-словари
+                    def _iter_segments(obj):
+                        if hasattr(obj, "itertracks"):
+                            for turn, _, spk in obj.itertracks(yield_label=True):
+                                yield float(turn.start), float(turn.end), spk
+                        elif isinstance(obj, list):
+                            for it in obj:
+                                if isinstance(it, dict) and "start" in it and "end" in it:
+                                    yield float(it["start"]), float(it["end"]), it.get("speaker")
+                        else:
+                            return
+                    # Проверим что есть хотя бы один сегмент
+                    has_any = False
+                    for _ in _iter_segments(diarization_annotation):
+                        has_any = True
+                        break
+                    if not has_any:
+                        raise ValueError("diarization produced no segments")
+                    # Получаем длительность файла для корректного паддинга/клампа
+                    try:
+                        info = torchaudio.info(audio_path)
+                        audio_dur = info.num_frames / info.sample_rate
+                    except Exception:
+                        audio_dur = None
+                    segment_chunks = []
+                    for s, e, _spk in _iter_segments(diarization_annotation):
+                        pad = float(getattr(settings, "ASR_SEGMENT_PAD_S", 0.1))
+                        min_len = float(getattr(settings, "MIN_ASR_SEGMENT_S", 0.5))
+                        qs = s - pad
+                        qe = e + pad
+                        if audio_dur is not None:
+                            qs = max(0.0, qs)
+                            qe = min(audio_dur, qe)
+                        if (qe - qs) < min_len:
+                            # Расширяем до минимальной длительности вокруг середины
+                            mid = (qs + qe) / 2.0
+                            qs = max(0.0, mid - min_len / 2.0)
+                            qe = qs + min_len
+                            if audio_dur is not None and qe > audio_dur:
+                                qe = audio_dur
+                                qs = max(0.0, qe - min_len)
+                        seg_path = _save_segment_to_wav_local(audio_path, qs, qe)
+                        try:
+                            text = gigaam_recognizer.model.transcribe(seg_path)
+                        finally:
+                            try:
+                                os.remove(seg_path)
+                            except Exception:
+                                pass
+                        text = text if isinstance(text, str) else str(text)
+                        if text.strip():
+                            segment_chunks.append({
+                                "timestamp": [s, e],
+                                "text": text.strip()
+                            })
+                    chunks = segment_chunks
+                    logging.info(f"🧩 Сегментная транскрипция по диаризации: {len(chunks)} сегментов")
+            except Exception as e:
+                logging.warning(f"⚠️ Не удалось выполнить ASR по сегментам диаризации: {e}. Используем обычные чанки")
         except TypeError:
             # Если не поддерживается, используем обычный вызов
             # Параметры уже установлены при загрузке pipeline
@@ -429,6 +518,8 @@ def process_audio_optimized(audio_path, tracks=None, users_info=None):
     t2.join()
     
     full_text, chunks = transcription_result[0]
+    
+    
      # Используем УЛУЧШЕННОЕ объединение с контекстом
     result = align_diarization_and_transcript_contextual(
         diarization_result, chunks, tracks, users_info
@@ -436,6 +527,29 @@ def process_audio_optimized(audio_path, tracks=None, users_info=None):
     
     PerformanceOptimizer.log_processing_time(start_time, "Полная обработка")
     return result
+
+def _save_segment_to_wav_local(wav_file: str, start: float, end: float) -> str:
+    try:
+        waveform, sr = torchaudio.load(wav_file)
+        start_i = max(0, int(start * sr))
+        end_i = min(waveform.shape[-1], int(end * sr))
+        if end_i <= start_i:
+            end_i = min(waveform.shape[-1], start_i + 1)
+        seg = waveform[:, start_i:end_i]
+        if sr != 16000:
+            seg = torchaudio.functional.resample(seg, orig_freq=sr, new_freq=16000)
+            sr = 16000
+        if seg.dim() == 2 and seg.size(0) > 1:
+            seg = seg[:1, :]
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        torchaudio.save(path, seg, sample_rate=sr)
+        return path
+    except Exception as e:
+        logging.error(f"❌ Ошибка сохранения сегмента WAV: {e}")
+        raise
+
 
 def parse_tracks_json(json_path):
     """Парсинг JSON файла с треками (каждая строка - отдельный JSON объект)"""
@@ -467,6 +581,12 @@ def get_user_id_for_time_advanced(tracks, start_time, end_time, previous_segment
     start_ms = start_time * 1000
     end_ms = end_time * 1000
     segment_duration_ms = (end_time - start_time) * 1000
+    expand = getattr(settings, "USER_MATCH_EXPAND_MS", 3000)
+    near_start_thresh = getattr(settings, "USER_NEAR_START_DIFF_MS", 4000)
+    min_overlap_pct_segment = getattr(settings, "MIN_OVERLAP_PCT_SEGMENT", 0.2)
+    expanded_start_ms = start_ms - expand
+    expanded_end_ms = end_ms + expand
+    expanded_duration_ms = max(1, (expanded_end_ms - expanded_start_ms))
     
     # Кандидаты и их оценки
     candidates = {}
@@ -477,15 +597,15 @@ def get_user_id_for_time_advanced(tracks, start_time, end_time, previous_segment
         user_id = track['user_id']
         
         # Базовое перекрытие
-        overlap_start = max(start_ms, track_start)
-        overlap_end = min(end_ms, track_end)
+        overlap_start = max(expanded_start_ms, track_start)
+        overlap_end = min(expanded_end_ms, track_end)
         overlap_duration = max(0, overlap_end - overlap_start)
         
         if overlap_duration == 0:
             continue
             
         # Процент перекрытия относительно сегмента и трека
-        overlap_pct_segment = overlap_duration / segment_duration_ms if segment_duration_ms > 0 else 0
+        overlap_pct_segment = overlap_duration / expanded_duration_ms if expanded_duration_ms > 0 else 0
         overlap_pct_track = overlap_duration / (track_end - track_start) if (track_end - track_start) > 0 else 0
         
         # Взвешенная оценка перекрытия
@@ -493,9 +613,9 @@ def get_user_id_for_time_advanced(tracks, start_time, end_time, previous_segment
         
         # Штраф за временное несоответствие
         time_penalty = 0
-        if overlap_pct_segment < 0.3:  # Малое перекрытие
+        if overlap_pct_segment < min_overlap_pct_segment:  # Малое перекрытие
             time_penalty = 0.3
-        elif abs(track_start - start_ms) > 2000:  # Большой разрыв по началу
+        elif abs(track_start - start_ms) > near_start_thresh:  # Большой разрыв по началу
             time_penalty = 0.2
             
         final_score = max(0, overlap_score - time_penalty)
@@ -562,8 +682,8 @@ def parse_event_path_and_get_range(path: str) -> tuple[str, str, str]:
     dt = datetime.strptime(raw_dt, "%Y-%m-%dT%H-%M-%S")
 
     # Вычисляем диапазон ±5 часов
-    time_start = dt - timedelta(hours=2)
-    time_end = dt + timedelta(hours=2)
+    time_start = dt - timedelta(hours=5)
+    time_end = dt - timedelta(hours=0)
 
     # Возвращаем ISO8601 в UTC
     return (
@@ -577,6 +697,8 @@ def get_user_id_contextual(tracks, start_time, end_time, previous_segments=None)
     
     start_ms = start_time * 1000
     end_ms = end_time * 1000
+    near_start_thresh = getattr(settings, "USER_NEAR_START_DIFF_MS", 4000)
+    context_window = getattr(settings, "USER_CONTEXT_WINDOW_MS", 8000)
     
     # 1. Предыдущий спикер (для коротких реплик)
     if previous_segments and len(previous_segments) > 0:
@@ -592,7 +714,7 @@ def get_user_id_contextual(tracks, start_time, end_time, previous_segments=None)
             # Проверяем, есть ли треки этого пользователя вблизи
             for track in tracks:
                 if (track['user_id'] == last_user_id and
-                    abs(track['start_ms'] - start_ms) < 3000):
+                    abs(track['start_ms'] - start_ms) < near_start_thresh):
                     logging.debug(f"🎯 Контекст: короткая реплика от предыдущего спикера {last_user_id}")
                     return last_user_id
     
@@ -616,7 +738,7 @@ def get_user_id_contextual(tracks, start_time, end_time, previous_segments=None)
             closest_track = track
     
     # 3. Принимаем решение на основе близости
-    if closest_track and min_diff < 3000:  # 3 секунды
+    if closest_track and min_diff < near_start_thresh:
         user_id = closest_track['user_id']
         
         # Дополнительная проверка: смотрим на длительность трека
@@ -630,8 +752,8 @@ def get_user_id_contextual(tracks, start_time, end_time, previous_segments=None)
     
     # 4. Статистика по пользователям в временном окне
     user_durations = {}
-    time_window_start = start_ms - 5000  # 5 секунд до
-    time_window_end = end_ms + 5000      # 5 секунд после
+    time_window_start = start_ms - context_window // 2
+    time_window_end = end_ms + context_window // 2
     
     for track in tracks:
         if (track['end_ms'] > time_window_start and 
@@ -735,9 +857,10 @@ def align_diarization_and_transcript_contextual(diarization, transcript_chunks, 
         max_overlap = 0
         
         try:
-            for turn, _, speaker in diarization_annotation.itertracks(yield_label=True):
-                overlap_start = max(start, turn.start)
-                overlap_end = min(end, turn.end)
+            for turn in diarization_annotation:
+                overlap_start = max(start, turn.get("start"))
+                overlap_end = min(end, turn.get("end"))
+                speaker = turn.get("speaker")
                 overlap_duration = max(0, overlap_end - overlap_start)
 
                 if overlap_duration > max_overlap:
@@ -751,15 +874,10 @@ def align_diarization_and_transcript_contextual(diarization, transcript_chunks, 
         # ОПРЕДЕЛЯЕМ user_id через mapping
         user_id = None
         if tracks:
-            if best_speaker in speaker_user_mapping:
-                user_id = speaker_user_mapping[best_speaker]
-                method = "speaker_mapping"
-            else:
-                # Резервный метод для неизвестных спикеров
-                user_id = get_user_id_for_time_advanced(
-                    tracks, start, end, previous_segments, speaker_history
-                )
-                method = "time_overlap"
+            # Мажоритарное назначение user_id по суммарному перекрытию в интервале сегмента
+            user_id = get_user_id_majority_overlap(tracks, start, end)
+            method = "majority_overlap"
+
             
             if user_id:
                 logging.debug(f"🎯 user_id {user_id} для сегмента {start:.2f}-{end:.2f} (метод: {method})")
@@ -958,8 +1076,9 @@ def format_segments_to_lines(segments):
 
         line = f"{speaker}: {text}"
         lines.append(line)
+        lines.append('\n\n')
 
-    return '\n'.join(lines)
+    return ''.join(lines)
 
 def send_email(subject: str, body: str, to_email: str = None):
     """
@@ -994,12 +1113,13 @@ def create_speaker_to_user_mapping_balanced(diarization_annotation, tracks, tran
     speaker_scores = {}
     
     logging.info("🎯 Начинаем создание mapping между спикерами и user_id...")
-    
+    diarization_annotation_filtered = diarization_annotation
     # Сбор статистики по всем сегментам диаризации
-    for turn, _, speaker in diarization_annotation.itertracks(yield_label=True):
-        speaker_start = turn.start
-        speaker_end = turn.end
-        
+    for seg in diarization_annotation_filtered:
+        speaker_start = float(seg.get("start",0))
+        speaker_end = float(seg.get("end",0))
+        speaker = seg.get("speaker")
+        logging.info("🎯 переработали сегменты")
         # Ищем лучший user_id для этого сегмента диаризации
         best_user_id = get_user_id_for_time_advanced(tracks, speaker_start, speaker_end)
         
@@ -1010,7 +1130,7 @@ def create_speaker_to_user_mapping_balanced(diarization_annotation, tracks, tran
             # Суммируем время для каждой пары спикер-user_id
             duration = speaker_end - speaker_start
             speaker_scores[speaker][best_user_id] = speaker_scores[speaker].get(best_user_id, 0) + duration
-    
+        logging.info(f"🎯 userId: {best_user_id}")
     # Логируем собранную статистику
     for speaker, user_scores in speaker_scores.items():
         total_time = sum(user_scores.values())
@@ -1262,8 +1382,7 @@ def process_directory(s3_prefix):
         
           # ОТПРАВКА РЕЗУЛЬТАТА НА ПОЧТУ
         if owner_email:
-            logging.info(f"Отправка результата на почту {format_segments_to_lines(result_segments)}")
-            send_email(f"расшифровка dion-конференции за {iso8601_to_dd_mm_yyyy(time_start)} комната {slug!r}", format_segments_to_lines(result_segments), to_email=owner_email)
+            send_email(f"расшифровка dion-конференции за {iso8601_to_dd_mm_yyyy(time_start)} комната {slug!r}", format_segments_to_lines(result_segments), to_email="safedotov@nrb.ru")
         else:
             raise Exception(f"Не найдена почта владельная по {s3_prefix}")
            
@@ -1305,10 +1424,10 @@ def process_directory(s3_prefix):
         logging.error(f"❌ Ошибка обработки директории {s3_prefix}: {e}")
         send_email(f"Ошибка диаризации {s3_prefix}", str(e))
     finally:
-        if local_audio_path and os.path.exists(local_audio_path):
-            os.remove(local_audio_path)
-        if local_json_path and os.path.exists(local_json_path):
-            os.remove(local_json_path)
+        # if local_audio_path and os.path.exists(local_audio_path):
+        #     os.remove(local_audio_path)
+        # if local_json_path and os.path.exists(local_json_path):
+        #     os.remove(local_json_path)
         # Очищаем память после обработки
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
