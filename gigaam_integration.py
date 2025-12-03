@@ -50,8 +50,8 @@ class GigaAMRecognizer:
             def _load(kind: str):
                 try:
                     logging.info(f"📥 Starting gigaam.load_model({kind})")
-                    os.environ["HTTP_PROXY"] = "http://dmsk2054:8080"
-                    os.environ["HTTPS_PROXY"] = "http://dmsk2054:8080"
+                    #os.environ["HTTP_PROXY"] = "http://dmsk2054:8080"
+                    #os.environ["HTTPS_PROXY"] = "http://dmsk2054:8080"
 
                     result["model"] = gigaam.load_model(kind)
                     os.environ["HTTP_PROXY"] = ""
@@ -165,8 +165,8 @@ class GigaAMRecognizer:
                 logging.warning("HF_TOKEN not set. Long-form transcription might fail. Set HF_TOKEN with read access to 'pyannote/segmentation-3.0'")
             
             # Perform long-form transcription
-            utterances = self.model.transcribe_longform(audio_path)
-            
+            utterances = self.model.transcribe_longform(audio_path,min_duration=0.01, max_duration=3, new_chunk_threshold=0.2,strict_limit_duration=2)
+            logging.info(utterances)
             # Format the result
             segments = []
             for utt in utterances:

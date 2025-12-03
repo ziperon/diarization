@@ -20,8 +20,8 @@ EMAIL_TO = ""
 EMAIL_FROM = "svc_transcribation@mncap.ru"
 EMAIL_USE_TLS = True
 
-os.environ["HTTP_PROXY"] = "http://dmsk2054:8080"
-os.environ["HTTPS_PROXY"] ="http://dmsk2054:8080"
+os.environ["HTTP_PROXY"] = ""
+os.environ["HTTPS_PROXY"] =""
 os.environ["HF_TOKEN"]="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"
 
 # DION API конфигурация
@@ -39,7 +39,7 @@ WHISPER_MODEL = "large-v3"  # ← ИСПОЛЬЗУЕМ large-v2 (быстрее 
 TRANSCRIPTION_MODE = os.getenv("TRANSCRIPTION_MODE", "quality").lower()  # По умолчанию качество
 # Основной ASR и параметры GigaAM
 GIGAAM_MODEL_TYPE = os.getenv("GIGAAM_MODEL_TYPE", "v3_e2e_rnnt")
-ASR_PRIMARY = os.getenv("ASR_PRIMARY", "whisper")  # "gigaam" | "whisper"
+ASR_PRIMARY = os.getenv("ASR_PRIMARY", "gigaam")  # "gigaam" | "whisper"
 
 # Параметры диаризации для улучшения разделения спикеров
 # Порог кластеризации: меньше значение = больше спикеров (по умолчанию 0.704, для лучшего разделения используйте 0.5-0.65)

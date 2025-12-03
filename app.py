@@ -10,7 +10,7 @@ from email.mime.text import MIMEText
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-from typing import Optional
+from typing import Optional, List, Dict, Any, Tuple, Union
 import librosa
 import soundfile as sf
 from fastapi import FastAPI
@@ -382,7 +382,6 @@ def transcribe_optimized(audio_path):
         if settings.ASR_PRIMARY == "gigaam":
             full_text, chunks = try_gigaam()
             logging.info(f"✅ GigaAM транскрипция завершена за {time.time() - start_time:.1f} сек")
-            logging.info(f"Text: {full_text} Chunk: {chunks}")
         else:
             full_text, chunks = try_whisper()
     except Exception as primary_err:
@@ -682,8 +681,8 @@ def parse_event_path_and_get_range(path: str) -> tuple[str, str, str]:
     dt = datetime.strptime(raw_dt, "%Y-%m-%dT%H-%M-%S")
 
     # Вычисляем диапазон ±5 часов
-    time_start = dt - timedelta(hours=5)
-    time_end = dt - timedelta(hours=0)
+    time_start = dt - timedelta(hours=1)
+    time_end = dt + timedelta(hours=1)
 
     # Возвращаем ISO8601 в UTC
     return (
@@ -1382,7 +1381,7 @@ def process_directory(s3_prefix):
         
           # ОТПРАВКА РЕЗУЛЬТАТА НА ПОЧТУ
         if owner_email:
-            send_email(f"расшифровка dion-конференции за {iso8601_to_dd_mm_yyyy(time_start)} комната {slug!r}", format_segments_to_lines(result_segments), to_email="safedotov@nrb.ru")
+            send_email(f"расшифровка dion-конференции за {iso8601_to_dd_mm_yyyy(time_start)} комната {slug!r}", format_segments_to_lines(result_segments), to_email=owner_email)
         else:
             raise Exception(f"Не найдена почта владельная по {s3_prefix}")
            
@@ -1608,10 +1607,10 @@ async def background_loop():
                     if len(parts) >= 2:
                         uuid_part = parts[-2]
                         timestamp_part = parts[-1]
-
-                        if uuid_part not in settings.UUID_WHITELIST:
-                            #logging.info(f"⚠️ UUID {uuid_part} не в белом списке, пропускаем")
-                            continue
+                        
+                        # if uuid_part not in settings.UUID_WHITELIST:
+                        #     #logging.info(f"⚠️ UUID {uuid_part} не в белом списке, пропускаем")
+                        #     continue
                         
                         # Проверяем, что это похоже на UUID и timestamp
                         if len(uuid_part) == 36 and 'T' in timestamp_part:
