@@ -1325,7 +1325,7 @@ def process_directory(s3_prefix):
 
         # Берём диапазон по дате события (например ±5 часов)
         event_id, time_start, time_end = parse_event_path_and_get_range(s3_prefix)
-        if settings.DION_API_ENABLED and tracks:
+        if settings.DION_API_ENABLED:
             try:
                 dion_client = DionApiClient(access_token=decrypt_password(settings.DION_ACCESS_TOKEN))
                 # Собираем все уникальные user_id из треков
@@ -1607,7 +1607,7 @@ async def background_loop():
                     if len(parts) >= 2:
                         uuid_part = parts[-2]
                         timestamp_part = parts[-1]
-                        
+
                         # if uuid_part not in settings.UUID_WHITELIST:
                         #     #logging.info(f"⚠️ UUID {uuid_part} не в белом списке, пропускаем")
                         #     continue
