@@ -97,38 +97,186 @@ class PerformanceOptimizer:
         elapsed = time.time() - start_time
         logging.info(f"⏱ {operation_name}: {elapsed:.1f} сек")
 
-# ------------------- Быстрая конвертация -------------------
-def convert_to_wav_fast(input_path):
-    """Быстрая конвертация аудио"""
-    logging.info(f"⚡ Конвертируем {os.path.basename(input_path)}...")
+def split_webm_audio_tracks(input_path: str, output_dir: str = None) -> list:
+    """
+    Split a WebM file into separate audio tracks.
+    Returns a list of paths to the extracted audio tracks.
+    """
+    if output_dir is None:
+        output_dir = os.path.dirname(input_path) or "."
+    
+    logging.info(f"🔊 Разделение аудио дорожек из {os.path.basename(input_path)}...")
     start_time = time.time()
     
-    temp_path = input_path.rsplit('.', 1)[0] + "_fast.wav"
-    
     try:
-        # Оптимизированные параметры FFmpeg
+        # Get list of audio tracks using ffprobe
         cmd = [
-            "ffmpeg", "-y", 
-            "-i", input_path,
-            "-ar", "16000",
-            "-ac", "1",
-            "-acodec", "pcm_s16le",
-            "-filter:a", "loudnorm=I=-17:TP=-1.5:LRA=11",
-            "-threads", "4",  # ↑ многопоточность
-            "-hide_banner",
-            "-loglevel", "error",
-            temp_path
+            "ffprobe", 
+            "-hide_banner", 
+            "-v", "error", 
+            "-select_streams", "a", 
+            "-show_entries", "stream=index,codec_name,nb_read_packets", 
+            "-of", "csv=p=0", 
+            input_path
         ]
         
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        os.replace(temp_path, input_path)
-        PerformanceOptimizer.log_processing_time(start_time, "Конвертация")
-        return input_path
+        audio_streams = []
         
+        for line in result.stdout.strip().split('\n'):
+            if not line:
+                continue
+            try:
+                stream_info = line.split(',')
+                if len(stream_info) >= 3 and stream_info[2] != "N/A" and int(stream_info[2]) > 0:
+                    audio_streams.append(int(stream_info[0]))
+            except (ValueError, IndexError):
+                continue
+        
+        if not audio_streams:
+            logging.warning("⚠️ В файле не найдено аудио дорожек")
+            return []
+        
+        # Extract each audio track
+        output_files = []
+        for stream_index in audio_streams:
+            output_file = os.path.join(output_dir, f"track_{stream_index}.wav")
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", input_path,
+                "-map", f"0:a:{stream_index - 1}",  # ffmpeg uses 0-based indexing
+                "-c:a", "pcm_s16le",
+                "-ar", "16000",
+                "-ac", "1",
+                "-f", "wav",
+                output_file
+            ]
+            
+            try:
+                subprocess.run(cmd, check=True, capture_output=True)
+                output_files.append(output_file)
+                logging.info(f"  ✅ Извлечена аудио дорожка {stream_index} -> {os.path.basename(output_file)}")
+            except subprocess.CalledProcessError as e:
+                logging.error(f"❌ Ошибка извлечения аудио дорожки {stream_index}: {e.stderr}")
+        
+        PerformanceOptimizer.log_processing_time(start_time, "Разделение аудио дорожек")
+        return output_files
+        
+    except subprocess.CalledProcessError as e:
+        logging.error(f"❌ Ошибка анализа аудио потоков: {e.stderr}")
+        raise
     except Exception as e:
-        logging.error(f"❌ Ошибка конвертации: {e}")
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        logging.error(f"❌ Неожиданная ошибка при разделении аудио дорожек: {str(e)}")
+        raise
+
+# ------------------- Быстрая конвертация -------------------
+def convert_to_wav_fast(input_path):
+    """Быстрая конвертация аудио с поддержкой WebM"""
+    logging.info(f"⚡ Конвертируем {os.path.basename(input_path)}...")
+    start_time = time.time()
+    
+    # Check if input is WebM
+    is_webm = input_path.lower().endswith('.webm')
+    
+    try:
+        if is_webm:
+            # For WebM files, first split into separate audio tracks
+            output_dir = os.path.dirname(input_path) or "."
+            temp_dir = tempfile.mkdtemp(prefix="webm_tracks_", dir=output_dir)
+            
+            try:
+                # Split WebM into separate tracks
+                track_files = split_webm_audio_tracks(input_path, temp_dir)
+                
+                if not track_files:
+                    raise ValueError("Не удалось извлечь аудио дорожки из WebM файла")
+                
+                # Process the first track (you might want to modify this based on your needs)
+                main_track = track_files[0]
+                output_path = input_path.rsplit('.', 1)[0] + ".wav"
+                
+                # Convert the first track to the final format
+                cmd = [
+                    "ffmpeg", "-y", 
+                    "-i", main_track,
+                    "-ar", "16000",
+                    "-ac", "1",
+                    "-acodec", "pcm_s16le",
+                    "-filter:a", "loudnorm=I=-17:TP=-1.5:LRA=11",
+                    "-threads", "4",
+                    "-hide_banner",
+                    "-loglevel", "error",
+                    output_path
+                ]
+                
+                subprocess.run(cmd, check=True)
+                PerformanceOptimizer.log_processing_time(start_time, "Конвертация WebM")
+                
+                # Clean up temporary files
+                for track_file in track_files:
+                    try:
+                        os.remove(track_file)
+                    except OSError:
+                        pass
+                try:
+                    os.rmdir(temp_dir)
+                except OSError:
+                    pass
+                    
+                return output_path
+                
+            except Exception as e:
+                # Clean up on error
+                if 'temp_dir' in locals():
+                    for track_file in track_files:
+                        try:
+                            os.remove(track_file)
+                        except OSError:
+                            pass
+                    try:
+                        os.rmdir(temp_dir)
+                    except OSError:
+                        pass
+                raise
+                
+        else:
+            # Original behavior for non-WebM files
+            temp_path = input_path.rsplit('.', 1)[0] + "_fast.wav"
+            
+            # Оптимизированные параметры FFmpeg
+            cmd = [
+                "ffmpeg", "-y", 
+                "-i", input_path,
+                "-ar", "16000",
+                "-ac", "1",
+                "-acodec", "pcm_s16le",
+                "-filter:a", "loudnorm=I=-17:TP=-1.5:LRA=11",
+                "-threads", "4",  # ↑ многопоточность
+                "-hide_banner",
+                "-loglevel", "error",
+                temp_path
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            os.replace(temp_path, input_path)
+            PerformanceOptimizer.log_processing_time(start_time, "Конвертация")
+            return input_path
+            
+    except subprocess.CalledProcessError as e:
+        logging.error(f"❌ Ошибка конвертации: {e.stderr}")
+        if 'temp_path' in locals() and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        raise
+    except Exception as e:
+        logging.error(f"❌ Неожиданная ошибка при конвертации: {str(e)}")
+        if 'temp_path' in locals() and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
         raise
 
 # ------------------- Оптимизированная загрузка моделей -------------------
@@ -551,35 +699,71 @@ def _save_segment_to_wav_local(wav_file: str, start: float, end: float) -> str:
         raise
 
 
-def parse_tracks_json(json_path):
-    """Парсинг JSON файла с треками (каждая строка - отдельный JSON объект)"""
-    tracks = []
+def parse_tracks_json(file_path):
+    """Парсинг JSON файла с треками, включая track_id и user_id"""
     try:
-        with open(json_path, 'r', encoding='utf-8') as f:
+        tracks = []
+        with open(file_path, 'r', encoding='utf-8') as f:
             for line in f:
-                line = line.strip()
-                if not line:
-                    continue
                 try:
-                    track = json.loads(line)
-                    # Конвертируем миллисекунды в секунды
-                    track['start_s'] = track['start_ms'] / 1000.0
-                    track['end_s'] = track['end_ms'] / 1000.0
+                    track = json.loads(line.strip())
+                    # Проверяем обязательные поля
+                    if not all(k in track for k in ['track_id', 'user_id', 'start_ms', 'end_ms']):
+                        logging.warning(f"⚠️ Отсутствуют обязательные поля в треке: {track}")
+                        continue
+                        
+                    # Преобразуем временные метки в миллисекунды, если они в секундах
+                    if 'start' in track and 'start_ms' not in track:
+                        track['start_ms'] = int(float(track['start']) * 1000)
+                    if 'end' in track and 'end_ms' not in track:
+                        track['end_ms'] = int(float(track['end']) * 1000)
+                        
+                    # Приводим типы к ожидаемым
+                    track['track_id'] = int(track['track_id'])
+                    track['user_id'] = str(track['user_id'])
+                    track['start_ms'] = int(track['start_ms'])
+                    track['end_ms'] = int(track['end_ms'])
+                    
+                    # Проверяем валидность временного интервала
+                    if track['end_ms'] <= track['start_ms']:
+                        logging.warning(f"⚠️ Некорректный временной интервал в треке: {track}")
+                        continue
+                        
                     tracks.append(track)
-                except json.JSONDecodeError as e:
-                    logging.warning(f"⚠️ Ошибка парсинга строки JSON: {e}")
+                    
+                except (json.JSONDecodeError, ValueError, TypeError) as e:
+                    logging.warning(f"⚠️ Ошибка парсинга строки JSON '{line.strip()}': {e}")
                     continue
-        logging.info(f"📋 Загружено {len(tracks)} треков из JSON")
+                    
+        logging.info(f"📋 Загружено {len(tracks)} валидных треков из JSON")
+        if tracks:
+            logging.info(f"📊 Диапазон треков: track_id от {min(t['track_id'] for t in tracks)} до {max(t['track_id'] for t in tracks)}")
+            logging.info(f"👥 Уникальных user_id: {len(set(t['user_id'] for t in tracks))}")
+            
         return tracks
+        
     except Exception as e:
-        logging.error(f"❌ Ошибка чтения JSON файла: {e}")
+        logging.error(f"❌ Ошибка чтения JSON файла {file_path}: {str(e)}")
         return []
 
-def get_user_id_for_time_advanced(tracks, start_time, end_time, previous_segments=None, speaker_history=None):
-    """Продвинутый алгоритм с учетом контекста и истории спикеров"""
-    
+def get_user_id_for_time_advanced(tracks, start_time, end_time, previous_segments=None, speaker_history=None, track_id=None):
+    """Продвинутый алгоритм с учетом track_id и user_id из JSON"""
     start_ms = start_time * 1000
     end_ms = end_time * 1000
+    
+    # Если передан track_id, ищем точное соответствие
+    if track_id is not None:
+        for track in tracks:
+            if track.get('track_id') == track_id:
+                track_start = track['start_ms']
+                track_end = track['end_ms']
+                # Проверяем перекрытие по времени
+                if not (end_ms < track_start or start_ms > track_end):
+                    logging.info(f"🔍 Найден user_id {track['user_id']} по track_id {track_id}")
+                    return track['user_id']
+        logging.debug(f"⚠️ Не найдено соответствия для track_id {track_id} в указанном временном диапазоне")
+    
+    # Если точного совпадения не найдено, используем старую логику
     segment_duration_ms = (end_time - start_time) * 1000
     expand = getattr(settings, "USER_MATCH_EXPAND_MS", 3000)
     near_start_thresh = getattr(settings, "USER_NEAR_START_DIFF_MS", 4000)
@@ -781,17 +965,35 @@ def get_user_id_contextual(tracks, start_time, end_time, previous_segments=None)
     return None
 
 def create_speaker_to_user_mapping(diarization_annotation, tracks, transcript_chunks):
-    """Создает mapping между спикерами диаризации и user_id из tracks"""
-    
+    """Создает mapping между спикерами диаризации и user_id из tracks с учетом track_id"""
     speaker_user_mapping = {}
     speaker_scores = {}
+    
+    # Создаем словарь для быстрого доступа к трекам по track_id
+    tracks_by_id = {t.get('track_id'): t for t in tracks if 'track_id' in t}
     
     # Проходим по всем сегментам диаризации
     for turn, _, speaker in diarization_annotation.itertracks(yield_label=True):
         speaker_start = turn.start
         speaker_end = turn.end
         
-        # Ищем подходящий user_id из tracks для этого сегмента диаризации
+        # Пытаемся определить track_id из имени спикера (например, "SPEAKER_01" -> track_id=1)
+        track_id = None
+        if speaker and speaker.startswith('SPEAKER_'):
+            try:
+                track_id = int(speaker.split('_')[1]) + 1  # +1 если нумерация с 1
+            except (IndexError, ValueError):
+                pass
+        
+        # Если нашли track_id, ищем соответствующий трек
+        if track_id in tracks_by_id:
+            track = tracks_by_id[track_id]
+            user_id = track['user_id']
+            speaker_user_mapping[speaker] = user_id
+            logging.info(f"🔗 Спикер {speaker} (track {track_id}) → user_id {user_id} (по track_id)")
+            continue
+            
+        # Если не нашли по track_id, используем временные метки
         best_user_id = get_user_id_for_time_advanced(tracks, speaker_start, speaker_end)
         
         if best_user_id:
@@ -805,8 +1007,11 @@ def create_speaker_to_user_mapping(diarization_annotation, tracks, transcript_ch
             duration = speaker_end - speaker_start
             speaker_scores[speaker][best_user_id] += duration
     
-    # Для каждого спикера выбираем user_id с наибольшим накопленным временем
+    # Для оставшихся спикеров выбираем user_id с наибольшим накопленным временем
     for speaker, user_scores in speaker_scores.items():
+        if speaker in speaker_user_mapping:
+            continue
+            
         if user_scores:
             best_user_id = max(user_scores.items(), key=lambda x: x[1])[0]
             total_time = sum(user_scores.values())
