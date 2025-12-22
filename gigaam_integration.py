@@ -166,7 +166,6 @@ class GigaAMRecognizer:
             
             # Perform long-form transcription
             utterances = self.model.transcribe_longform(audio_path,min_duration=0.01, max_duration=3, new_chunk_threshold=0.2,strict_limit_duration=2)
-            logging.info(utterances)
             # Format the result
             segments = []
             for utt in utterances:
@@ -279,7 +278,7 @@ class GigaAM3Diarizer:
 
     def transcribe_segment(self, wav_path: str) -> str:
         # Expecting GigaAM model to accept file path as in existing integration
-        return self.gigamodel.transcribe(wav_path)
+        return self.gigamodel.transcribe_longform(wav_path)
 
     def diarize_and_transcribe(self, wav_file: str) -> List[Dict]:
         segments = self.diarize(wav_file)

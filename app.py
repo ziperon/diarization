@@ -14,6 +14,7 @@ from typing import Optional, List, Dict, Any, Tuple, Union
 import librosa
 import soundfile as sf
 from fastapi import FastAPI
+from llm_utils import filter_profanity
 import boto3
 import torch
 import numpy as np
@@ -874,7 +875,7 @@ def align_diarization_and_transcript_contextual(diarization, transcript_chunks, 
         user_id = None
         if tracks:
             # Мажоритарное назначение user_id по суммарному перекрытию в интервале сегмента
-            user_id = get_user_id_majority_overlap(tracks, start, end)
+            user_id = get_user_id_for_time_advanced(tracks, start, end)
             method = "majority_overlap"
 
             
@@ -1118,7 +1119,7 @@ def create_speaker_to_user_mapping_balanced(diarization_annotation, tracks, tran
         speaker_start = float(seg.get("start",0))
         speaker_end = float(seg.get("end",0))
         speaker = seg.get("speaker")
-        logging.info("🎯 переработали сегменты")
+        #logging.info("🎯 переработали сегменты")
         # Ищем лучший user_id для этого сегмента диаризации
         best_user_id = get_user_id_for_time_advanced(tracks, speaker_start, speaker_end)
         
@@ -1129,14 +1130,14 @@ def create_speaker_to_user_mapping_balanced(diarization_annotation, tracks, tran
             # Суммируем время для каждой пары спикер-user_id
             duration = speaker_end - speaker_start
             speaker_scores[speaker][best_user_id] = speaker_scores[speaker].get(best_user_id, 0) + duration
-        logging.info(f"🎯 userId: {best_user_id}")
+        #logging.info(f"🎯 userId: {best_user_id}")
     # Логируем собранную статистику
     for speaker, user_scores in speaker_scores.items():
         total_time = sum(user_scores.values())
-        logging.info(f"📊 Спикер {speaker}: {len(user_scores)} кандидатов, общее время {total_time:.1f}с")
+        #logging.info(f"📊 Спикер {speaker}: {len(user_scores)} кандидатов, общее время {total_time:.1f}с")
         for user_id, time in user_scores.items():
             confidence = time / total_time
-            logging.info(f"   👤 {user_id}: {time:.1f}с ({confidence:.1%})")
+            #logging.info(f"   👤 {user_id}: {time:.1f}с ({confidence:.1%})")
     
     # Подготовка кандидатов для каждого спикера
     speaker_candidates = {}
@@ -1153,7 +1154,7 @@ def create_speaker_to_user_mapping_balanced(diarization_annotation, tracks, tran
         
         if candidates:
             best_user, best_conf, best_time = candidates[0]
-            logging.info(f"🎯 Спикер {speaker}: лучший кандидат {best_user} ({best_conf:.1%})")
+            #logging.info(f"🎯 Спикер {speaker}: лучший кандидат {best_user} ({best_conf:.1%})")
     
     # Многораундовое назначение с приоритетом уникальности
     
@@ -1169,7 +1170,7 @@ def create_speaker_to_user_mapping_balanced(diarization_annotation, tracks, tran
             if user_id not in assigned_users and confidence > 0.7:
                 speaker_user_mapping[speaker] = user_id
                 assigned_users.add(user_id)
-                logging.info(f"✅ [Раунд 1] {speaker} → {user_id} (уверенность: {confidence:.1%})")
+                #logging.info(f"✅ [Раунд 1] {speaker} → {user_id} (уверенность: {confidence:.1%})")
                 break
     
     # Раунд 2: назначаем уникальные пары с СРЕДНЕЙ уверенностью (> 0.5)
@@ -1182,7 +1183,7 @@ def create_speaker_to_user_mapping_balanced(diarization_annotation, tracks, tran
             if user_id not in assigned_users and confidence > 0.5:
                 speaker_user_mapping[speaker] = user_id
                 assigned_users.add(user_id)
-                logging.info(f"✅ [Раунд 2] {speaker} → {user_id} (уверенность: {confidence:.1%})")
+                #logging.info(f"✅ [Раунд 2] {speaker} → {user_id} (уверенность: {confidence:.1%})")
                 break
     
     # Раунд 3: назначаем уникальные пары с МИНИМАЛЬНОЙ уверенностью (> 0.3)
@@ -1195,7 +1196,7 @@ def create_speaker_to_user_mapping_balanced(diarization_annotation, tracks, tran
             if user_id not in assigned_users and confidence > 0.3:
                 speaker_user_mapping[speaker] = user_id
                 assigned_users.add(user_id)
-                logging.info(f"✅ [Раунд 3] {speaker} → {user_id} (уверенность: {confidence:.1%})")
+                #logging.info(f"✅ [Раунд 3] {speaker} → {user_id} (уверенность: {confidence:.1%})")
                 break
     
     # Раунд 4: УЛУЧШЕННЫЙ - ищем любого свободного кандидата, даже с низкой уверенностью
@@ -1210,7 +1211,7 @@ def create_speaker_to_user_mapping_balanced(diarization_annotation, tracks, tran
             if user_id not in assigned_users:
                 speaker_user_mapping[speaker] = user_id
                 assigned_users.add(user_id)
-                logging.info(f"✅ [Раунд 4] {speaker} → {user_id} (свободный, уверенность: {confidence:.1%})")
+                #logging.info(f"✅ [Раунд 4] {speaker} → {user_id} (свободный, уверенность: {confidence:.1%})")
                 assigned = True
                 break
         
@@ -1234,7 +1235,7 @@ def create_speaker_to_user_mapping_balanced(diarization_annotation, tracks, tran
                 logging.warning(f"⚠️ [Раунд 4] {speaker} → {best_user_id} (дублирование #{current_count + 1}, уверенность: {confidence:.1%})")
             else:
                 assigned_users.add(best_user_id)
-                logging.info(f"✅ [Раунд 4] {speaker} → {best_user_id} (уверенность: {confidence:.1%})")
+                #logging.info(f"✅ [Раунд 4] {speaker} → {best_user_id} (уверенность: {confidence:.1%})")
     
     # Финальная статистика
     logging.info("📈 ФИНАЛЬНАЯ СТАТИСТИКА MAPPING:")
@@ -1274,6 +1275,7 @@ def process_directory(s3_prefix):
         
         # Ищем mp4 и json файлы
         mp4_file = None
+        mp3_file = None
         json_file = None
         
         for file_obj in files:
@@ -1283,17 +1285,25 @@ def process_directory(s3_prefix):
             
             if ext == 'mp4':
                 mp4_file = key
+            if ext == 'mp3':
+                mp3_file = key
             elif ext == 'json':
                 json_file = key
         
-        if not mp4_file:
-            logging.warning(f"⚠️ MP4 файл не найден в {s3_prefix}")
+        if not mp4_file and not mp3_file:
+            logging.warning(f"⚠️  Файл для распознания не найден в {s3_prefix}")
             return
         
-        # Загружаем MP4 файл
-        local_audio_path = os.path.join(settings.LOCAL_TMP, str(hash(mp4_file)) + ".mp4")
-        logging.info(f"⬇️ Загружаем MP4 файл: {mp4_file}")
-        s3.download_file(settings.S3_BUCKET, mp4_file, local_audio_path)
+        if mp4_file:
+            # Загружаем MP4 файл
+            local_audio_path = os.path.join(settings.LOCAL_TMP, str(hash(mp4_file)) + ".mp4")
+            logging.info(f"⬇️ Загружаем MP4 файл: {mp4_file}")
+            s3.download_file(settings.S3_BUCKET, mp4_file, local_audio_path)
+        if mp3_file:    
+            # Загружаем MP3 файл
+            local_audio_path = os.path.join(settings.LOCAL_TMP, str(hash(mp3_file)) + ".mp3")
+            logging.info(f"⬇️ Загружаем MP3 файл: {mp3_file}")
+            s3.download_file(settings.S3_BUCKET, mp3_file, local_audio_path)
         
         file_size_mb = os.path.getsize(local_audio_path) / (1024 * 1024)
         logging.info(f"📊 Размер файла: {file_size_mb:.1f} MB")
@@ -1381,7 +1391,8 @@ def process_directory(s3_prefix):
         
           # ОТПРАВКА РЕЗУЛЬТАТА НА ПОЧТУ
         if owner_email:
-            send_email(f"расшифровка dion-конференции за {iso8601_to_dd_mm_yyyy(time_start)} комната {slug!r}", format_segments_to_lines(result_segments), to_email=owner_email)
+            result_profanity = filter_profanity(format_segments_to_lines(result_segments))
+            send_email(f"расшифровка dion-конференции за {iso8601_to_dd_mm_yyyy(time_start)} комната {slug!r}", result_profanity, to_email=owner_email)
         else:
             raise Exception(f"Не найдена почта владельная по {s3_prefix}")
            
@@ -1631,11 +1642,15 @@ async def background_loop():
                                 for f in dir_files
                             )
                             
-                            if has_mp4:
+                            has_mp3 = any(
+                                os.path.basename(f["Key"]).lower().endswith('.mp3') 
+                                for f in dir_files
+                            )
+                            
+                            if has_mp4 or has_mp3:
                                 directories_to_process.append(timestamp_prefix)
                                 logging.info(f"🎬 Найдена директория для обработки: {timestamp_prefix}")
-                            else:
-                                logging.info(f"📭 В директории {timestamp_prefix} нет MP4 файла")
+                            
                         else:
                             logging.info(f"⚠️ Директория {timestamp_prefix} не соответствует формату UUID/timestamp")
                     else:
