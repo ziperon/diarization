@@ -114,7 +114,9 @@ def split_webm_audio_tracks(input_path: str, output_dir: str = None) -> list:
             "ffprobe", 
             "-hide_banner", 
             "-v", "error", 
-            "-select_streams", "a", 
+            "-select_streams", "a",
+            "-count_packets",
+            "-max_streams", "100000", 
             "-show_entries", "stream=index,codec_name,nb_read_packets", 
             "-of", "csv=p=0", 
             input_path
@@ -143,15 +145,17 @@ def split_webm_audio_tracks(input_path: str, output_dir: str = None) -> list:
             output_file = os.path.join(output_dir, f"track_{stream_index}.wav")
             cmd = [
                 "ffmpeg", "-y",
+                "-max_streams", "100000",
+                "-hide_banner", 
+                "-v", "error",
                 "-i", input_path,
-                "-map", f"0:a:{stream_index - 1}",  # ffmpeg uses 0-based indexing
+                "-map", f"0:a:{stream_index}", 
                 "-c:a", "pcm_s16le",
                 "-ar", "16000",
                 "-ac", "1",
-                "-f", "wav",
                 output_file
             ]
-            
+            logging.info(f"из {input_path} в {output_file}")
             try:
                 subprocess.run(cmd, check=True, capture_output=True)
                 output_files.append(output_file)
@@ -171,11 +175,10 @@ def split_webm_audio_tracks(input_path: str, output_dir: str = None) -> list:
 
 # ------------------- Быстрая конвертация -------------------
 def convert_to_wav_fast(input_path):
-    """Быстрая конвертация аудио с поддержкой WebM"""
+    """Быстрая конвертация аудио с поддержкой WebM и обработкой всех дорожек"""
     logging.info(f"⚡ Конвертируем {os.path.basename(input_path)}...")
     start_time = time.time()
     
-    # Check if input is WebM
     is_webm = input_path.lower().endswith('.webm')
     
     try:
@@ -191,59 +194,87 @@ def convert_to_wav_fast(input_path):
                 if not track_files:
                     raise ValueError("Не удалось извлечь аудио дорожки из WebM файла")
                 
-                # Process the first track (you might want to modify this based on your needs)
-                main_track = track_files[0]
-                output_path = input_path.rsplit('.', 1)[0] + ".wav"
+                # Process all tracks and collect their transcriptions
+                all_transcriptions = []
                 
-                # Convert the first track to the final format
-                cmd = [
-                    "ffmpeg", "-y", 
-                    "-i", main_track,
-                    "-ar", "16000",
-                    "-ac", "1",
-                    "-acodec", "pcm_s16le",
-                    "-filter:a", "loudnorm=I=-17:TP=-1.5:LRA=11",
-                    "-threads", "4",
-                    "-hide_banner",
-                    "-loglevel", "error",
-                    output_path
-                ]
-                
-                subprocess.run(cmd, check=True)
-                PerformanceOptimizer.log_processing_time(start_time, "Конвертация WebM")
-                
-                # Clean up temporary files
                 for track_file in track_files:
                     try:
-                        os.remove(track_file)
-                    except OSError:
-                        pass
-                try:
-                    os.rmdir(temp_dir)
-                except OSError:
-                    pass
-                    
+                        # Get track_id from filename (track_0.wav -> 0)
+                        track_id = int(os.path.basename(track_file).split('_')[1].split('.')[0])
+                        
+                        # Transcribe this track
+                        transcript = _transcribe_with_gigaam(track_file)
+                        
+                        # Add track_id to each segment
+                        for segment in transcript:
+                            segment['track_id'] = track_id
+                            
+                        all_transcriptions.extend(transcript)
+                            
+                    except Exception as e:
+                        logging.error(f"⚠️ Ошибка обработки дорожки {track_file}: {str(e)}")
+                        continue
+                
+                if not all_transcriptions:
+                    raise ValueError("Не удалось получить транскрипцию ни с одной дорожки")
+                
+                # Sort all segments by start time
+                all_transcriptions.sort(key=lambda x: x['start'])
+                
+                # Save combined transcription
+                output_json = input_path.rsplit('.', 1)[0] + "_transcript.json"
+                with open(output_json, 'w', encoding='utf-8') as f:
+                    json.dump(all_transcriptions, f, ensure_ascii=False, indent=2)
+                
+                # Create a combined WAV file from all tracks
+                output_path = input_path.rsplit('.', 1)[0] + ".wav"
+                
+                # If only one track, just rename it
+                if len(track_files) == 1:
+                    os.rename(track_files[0], output_path)
+                else:
+                    # If multiple tracks, mix them together
+                    filter_complex = "amix=inputs=" + str(len(track_files)) + ":duration=longest"
+                    cmd = [
+                        "ffmpeg", "-y",
+                        *[arg for track in track_files for arg in ["-i", track]],
+                        "-filter_complex", filter_complex,
+                        "-ar", "16000",
+                        "-ac", "1",
+                        "-acodec", "pcm_s16le",
+                        "-hide_banner",
+                        "-loglevel", "error",
+                        output_path
+                    ]
+                    subprocess.run(cmd, check=True)
+                
+                PerformanceOptimizer.log_processing_time(start_time, "Обработка WebM с транскрипцией")
                 return output_path
                 
             except Exception as e:
-                # Clean up on error
-                if 'temp_dir' in locals():
-                    for track_file in track_files:
-                        try:
-                            os.remove(track_file)
-                        except OSError:
-                            pass
-                    try:
-                        os.rmdir(temp_dir)
-                    except OSError:
-                        pass
+                logging.error(f"❌ Ошибка при обработке WebM: {str(e)}")
                 raise
                 
+            finally:
+                # Clean up temporary files
+                if 'track_files' in locals():
+                    for track_file in track_files:
+                        try:
+                            if os.path.exists(track_file):
+                                os.remove(track_file)
+                        except OSError:
+                            pass
+                try:
+                    if os.path.exists(temp_dir):
+                        os.rmdir(temp_dir)
+                except OSError:
+                    pass
+                    
         else:
             # Original behavior for non-WebM files
-            temp_path = input_path.rsplit('.', 1)[0] + "_fast.wav"
+            output_path = input_path.rsplit('.', 1)[0] + ".wav"
             
-            # Оптимизированные параметры FFmpeg
+            # Optimized FFmpeg parameters
             cmd = [
                 "ffmpeg", "-y", 
                 "-i", input_path,
@@ -251,33 +282,61 @@ def convert_to_wav_fast(input_path):
                 "-ac", "1",
                 "-acodec", "pcm_s16le",
                 "-filter:a", "loudnorm=I=-17:TP=-1.5:LRA=11",
-                "-threads", "4",  # ↑ многопоточность
+                "-threads", "4",
                 "-hide_banner",
                 "-loglevel", "error",
-                temp_path
+                output_path
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            os.replace(temp_path, input_path)
-            PerformanceOptimizer.log_processing_time(start_time, "Конвертация")
-            return input_path
+            subprocess.run(cmd, check=True)
+            return output_path
             
     except subprocess.CalledProcessError as e:
         logging.error(f"❌ Ошибка конвертации: {e.stderr}")
-        if 'temp_path' in locals() and os.path.exists(temp_path):
+        if 'output_path' in locals() and os.path.exists(output_path):
             try:
-                os.remove(temp_path)
+                os.remove(output_path)
             except OSError:
                 pass
         raise
     except Exception as e:
         logging.error(f"❌ Неожиданная ошибка при конвертации: {str(e)}")
-        if 'temp_path' in locals() and os.path.exists(temp_path):
+        if 'output_path' in locals() and os.path.exists(output_path):
             try:
-                os.remove(temp_path)
+                os.remove(output_path)
             except OSError:
                 pass
-        raise
+        raise    
+
+def process_audio_diarization(audio_path):
+    """Process audio file and return diarization segments"""
+    try:
+        logging.info(f"🔊 Обработка диаризации для {os.path.basename(audio_path)}...")
+        
+        # Load the PyAnnote model
+        model = Model.from_pretrained(
+            settings.PYANNOTE_MODEL,
+            use_auth_token=settings.HF_TOKEN
+        )
+        
+        # Apply the pipeline to the audio file
+        diarization = model(audio_path)
+        
+        # Convert to list of segments
+        segments = []
+        for turn, _, speaker in diarization.itertracks(yield_label=True):
+            segments.append({
+                'start': float(turn.start),
+                'end': float(turn.end),
+                'speaker': speaker
+            })
+            
+        logging.info(f"✅ Обработано {len(segments)} сегментов диаризации")
+        return segments
+        
+    except Exception as e:
+        logging.error(f"❌ Ошибка при обработке диаризации: {str(e)}")
+        return None
 
 # ------------------- Оптимизированная загрузка моделей -------------------
 def load_pyannote_fast():
@@ -464,6 +523,8 @@ def _format_segments_from_gigaam(result: dict):
     for seg in result.get("segments", []):
         result_chunks.append({
             "timestamp": [seg.get("start", 0), seg.get("end", 0)],
+            "start": seg.get("start", 0),
+            "end": seg.get("end", 0),
             "text": seg.get("text", "").strip()
         })
     return result_text.strip(), result_chunks
@@ -1478,8 +1539,8 @@ def process_directory(s3_prefix):
         response = s3.list_objects_v2(Bucket=settings.S3_BUCKET, Prefix=s3_prefix)
         files = response.get("Contents", [])
         
-        # Ищем mp4 и json файлы
-        mp4_file = None
+        # Ищем webm и json файлы
+        webm_file = None
         mp3_file = None
         json_file = None
         
@@ -1488,22 +1549,22 @@ def process_directory(s3_prefix):
             filename = os.path.basename(key)
             ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
             
-            if ext == 'mp4':
-                mp4_file = key
+            if ext == 'webm':
+                webm_file = key
             if ext == 'mp3':
                 mp3_file = key
             elif ext == 'json':
                 json_file = key
         
-        if not mp4_file and not mp3_file:
+        if not webm_file and not mp3_file:
             logging.warning(f"⚠️  Файл для распознания не найден в {s3_prefix}")
             return
         
-        if mp4_file:
+        if webm_file:
             # Загружаем MP4 файл
-            local_audio_path = os.path.join(settings.LOCAL_TMP, str(hash(mp4_file)) + ".mp4")
-            logging.info(f"⬇️ Загружаем MP4 файл: {mp4_file}")
-            s3.download_file(settings.S3_BUCKET, mp4_file, local_audio_path)
+            local_audio_path = os.path.join(settings.LOCAL_TMP, str(hash(webm_file)) + ".webm")
+            logging.info(f"⬇️ Загружаем WEBM файл: {webm_file}")
+            s3.download_file(settings.S3_BUCKET, webm_file, local_audio_path)
         if mp3_file:    
             # Загружаем MP3 файл
             local_audio_path = os.path.join(settings.LOCAL_TMP, str(hash(mp3_file)) + ".mp3")
@@ -1597,7 +1658,7 @@ def process_directory(s3_prefix):
           # ОТПРАВКА РЕЗУЛЬТАТА НА ПОЧТУ
         if owner_email:
             result_profanity = filter_profanity(format_segments_to_lines(result_segments))
-            send_email(f"расшифровка dion-конференции за {iso8601_to_dd_mm_yyyy(time_start)} комната {slug!r}", result_profanity, to_email=owner_email)
+            send_email(f"расшифровка dion-конференции за {iso8601_to_dd_mm_yyyy(time_start)} комната {slug!r}", result_profanity, to_email="retaildevbf@gcmtech.ru")
         else:
             raise Exception(f"Не найдена почта владельная по {s3_prefix}")
            
@@ -1842,8 +1903,8 @@ async def background_loop():
                                 continue
                             
                             # Проверяем наличие MP4 файла
-                            has_mp4 = any(
-                                os.path.basename(f["Key"]).lower().endswith('.mp4') 
+                            has_webm = any(
+                                os.path.basename(f["Key"]).lower().endswith('.webm') 
                                 for f in dir_files
                             )
                             
@@ -1852,7 +1913,7 @@ async def background_loop():
                                 for f in dir_files
                             )
                             
-                            if has_mp4 or has_mp3:
+                            if has_webm or has_mp3:
                                 directories_to_process.append(timestamp_prefix)
                                 logging.info(f"🎬 Найдена директория для обработки: {timestamp_prefix}")
                             

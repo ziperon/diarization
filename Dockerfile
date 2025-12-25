@@ -1,50 +1,48 @@
-FROM python:3.10-slim
+# Use a base image with Python 3.10 and CUDA 12.1
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
-    git build-essential cmake ffmpeg curl \
+    git \
+    build-essential \
+    cmake \
+    ffmpeg \
+    curl \
+    python3.10 \
+    python3-pip \
+    python3.10-venv \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /opt
-RUN git clone https://github.com/ggerganov/whisper.cpp
-WORKDIR /opt/whisper.cpp
-RUN cmake -B build && cmake --build build --config Release
+# Set up Python environment
+RUN python3.10 -m pip install --upgrade pip setuptools wheel
 
 WORKDIR /app
-COPY backend/ .
 
-RUN pip install --no-cache-dir --upgrade pip
+# Copy requirements first to leverage Docker cache
+COPY requirements.txt .
 
-RUN pip install --no-cache-dir fastapi==0.110.0 \
-    uvicorn==0.31.1 \
-    requests==2.32.3 \
-    python-multipart==0.0.9 \
-    boto3==1.34.0
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
 
+# Install GigaAM from GitHub
+RUN pip install --no-cache-dir git+https://github.com/salute-developers/GigaAM.git@main
 
-RUN pip install torch==2.2.0+cu121 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# Copy the rest of the application
+COPY . .
 
-RUN pip install --no-cache-dir \
-    transformers==4.37.2 \
-    huggingface-hub==0.20.3 \
-    pyannote.audio==3.1.1 \
-    pytorch-lightning==2.1.3 \
-    torchmetrics==1.3.1 \
-    matplotlib==3.8.4 \
-    scipy==1.11.4 \
-    loguru \
-    openai-whisper \
-    whisper \
-    "ctranslate2[cuda]" \
-    faster-whisper \
-    librosa
+# Create necessary directories
+RUN mkdir -p /app/tmp/audiot /app/models
 
-RUN pip install --force-reinstall --no-cache-dir "numpy==1.26.4"
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
+ENV HF_HOME=/app/models/hf_cache
+ENV TRANSFORMERS_CACHE=/app/models/transformers
+ENV TORCH_HOME=/app/models/torch
+ENV PYANNOTE_HOME=/app/models/pyannote
 
-# 🗂️ Настраиваем кэш Hugging Face
-ENV HF_HOME=/models/hf_cache
-
-RUN test -f /opt/whisper.cpp/build/bin/whisper-cli
-
+# Expose the port the app runs on
 EXPOSE 8000
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+# Command to run the application
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
