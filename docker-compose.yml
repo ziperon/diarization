@@ -3,16 +3,27 @@ version: '3.8'
 services:
   speech-ai:
     build: .
+    runtime: nvidia  # Enable NVIDIA runtime
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all  # Use all available GPUs
+              capabilities: [gpu, utility, compute]
     ports:
       - "8000:8000"
     volumes:
       - ./:/app
       - ./models:/app/models
     environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - S3_ENABLED=0
       - PYANNOTE_MODEL=pyannote/speaker-diarization-3.1
-      - WHISPER_MODEL=base  # Using a smaller model for CPU
-      - TRANSCRIPTION_MODE=fast  # Changed to fast for CPU
+      - WHISPER_MODEL=large-v3  # Using larger model since we have GPU
+      - TRANSCRIPTION_MODE=quality  # Better quality with GPU
       - GIGAAM_MODEL_TYPE=v3_e2e_rnnt
-      - ASR_PRIMARY=whisper  # Using whisper as it's more CPU-friendly
-      - PARALLEL_WORKERS=1  # Reduced workers for CPU
+      - ASR_PRIMARY=gigaam  # Using GigaAM as primary with GPU
+      - PARALLEL_WORKERS=4  # Increased workers for GPU
+    shm_size: '2gb'  # Shared memory for better performance
