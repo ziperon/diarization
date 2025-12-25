@@ -36,6 +36,8 @@ matplotlib>=3.9,<4
 requests==2.32.3
 urllib3
 
+cryptography
+
 # Optional: Faster Whisper (for performance optimization)
 # faster-whisper
 # ctranslate2[cuda]  # Для GPU

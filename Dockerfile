@@ -1,5 +1,5 @@
-# Use a base image with Python 3.10 and CUDA 12.1
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+# Use a smaller base image for CPU
+FROM python:3.10-slim
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -8,20 +8,19 @@ RUN apt-get update && apt-get install -y \
     cmake \
     ffmpeg \
     curl \
-    python3.10 \
-    python3-pip \
-    python3.10-venv \
     && rm -rf /var/lib/apt/lists/*
 
 # Set up Python environment
-RUN python3.10 -m pip install --upgrade pip setuptools wheel
-
 WORKDIR /app
 
 # Copy requirements first to leverage Docker cache
 COPY requirements.txt .
 
-# Install Python dependencies
+# Install Python dependencies with CPU-only PyTorch
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# Install other requirements
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Install GigaAM from GitHub
