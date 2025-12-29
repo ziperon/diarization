@@ -17,7 +17,8 @@ RUN apt-get update && apt-get install -y \
     python3.10 \
     python3-pip \
     python3.10-venv \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/bin/python3.10 /usr/bin/python
 
 # Set up Python environment
 WORKDIR /app
@@ -50,12 +51,12 @@ ENV TORCH_HOME=/app/models/torch
 ENV PYANNOTE_HOME=/app/models/pyannote
 ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 
-# Verify Python architecture and CUDA
-RUN python -c "import platform; print(f'Python architecture: {platform.architecture()}')" && \
-    python -c "import struct; print(f'Pointer size: {8 * struct.calcsize('P')} bits')" && \
-    python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); \
-               print(f'Number of GPUs: {torch.cuda.device_count()}'); \
-               [print(f'GPU {i}: {torch.cuda.get_device_name(i)}') for i in range(torch.cuda.device_count())]"
+# # Verify Python architecture and CUDA
+# RUN python -c "import platform; print(f'Python architecture: {platform.architecture()}')" && \
+#     python -c "import struct; print(f'Pointer size: {8 * struct.calcsize('P')} bits')" && \
+#     python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); \
+#                print(f'Number of GPUs: {torch.cuda.device_count()}'); \
+#                [print(f'GPU {i}: {torch.cuda.get_device_name(i)}') for i in range(torch.cuda.device_count())]"
 
 # Expose the port the app runs on
 EXPOSE 8000
